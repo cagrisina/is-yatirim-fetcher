@@ -6,7 +6,6 @@ import requests
 from requests.adapters import HTTPAdapter
 import pandas as pd
 from pandas.tseries.offsets import BDay
-import yfinance as yf
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import concurrent.futures
@@ -215,33 +214,6 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
         }
 
 
-# ==============================================================================
-# 3. AMERİKA (US) MOTORU (SAF SAYILARLA)
-# ==============================================================================
-
-def fetch_us_stock_data(symbol, period_str):
-    try:
-        ticker = yf.Ticker(symbol)
-        bs = ticker.balance_sheet; fin = ticker.financials; cf = ticker.cashflow
-        if bs.empty or fin.empty: return None
-        
-        equity = bs.loc['Stockholders Equity'].iloc[0] if 'Stockholders Equity' in bs.index else 0
-        debt = bs.loc['Total Debt'].iloc[0] if 'Total Debt' in bs.index else 0
-        op_income = fin.loc['Operating Income'].iloc[0] if 'Operating Income' in fin.index else "N/A"
-        op_cash_flow = "N/A"
-        for key in ['Operating Cash Flow', 'Cash Flow From Operating Activities']:
-            if key in cf.index: op_cash_flow = cf.loc[key].iloc[0]; break
-                
-        try: actual_period = f"{bs.columns[0].year}/{bs.columns[0].month:02d}"
-        except: actual_period = ""
-            
-        return {
-            "debt_equity": (debt / equity) if equity != 0 else "N/A",
-            "op_income": op_income, "op_cash_flow": op_cash_flow,
-            "resolved_period": actual_period
-        }
-    except: return None
-
 
 # ==============================================================================
 # 4. YABANCI TAKAS ORANI MOTORU
@@ -303,11 +275,6 @@ def task_tr_stock(row_idx, symbol):
     if result is None: result = {k: "" for k in ['debt_equity', 'op_income_ttm', 'op_income_q', 'op_cash_flow_ttm', 'op_cash_flow_q', 'net_fx', 'export_ratio_ttm', 'export_ratio_q', 'resolved_period', 'item_2oa', 'ozk', 'net_borc', 'favok_ttm', 'favok_q']}
     return {'row_idx': row_idx, 'symbol': symbol, 'data': result}
 
-def task_us_stock(row_idx, symbol, period_val):
-    result = fetch_us_stock_data(symbol, period_val)
-    if result is None: result = {k: "" for k in ['debt_equity', 'op_income', 'op_cash_flow', 'resolved_period']}
-    return {'row_idx': row_idx, 'symbol': symbol, 'data': result}
-
 def task_yabanci_oran(row_idx, symbol, date_a, date_b):
     return {'row_idx': row_idx, 'symbol': symbol, 'data': fetch_yabanci_oran(symbol, date_a, date_b)}
 
@@ -318,11 +285,11 @@ def task_yabanci_oran(row_idx, symbol, date_a, date_b):
 
 def main_automation():
     file_name = "analysis.xlsx"
-    sheet_tr_name, sheet_us_name, sheet_yab_name = "Main_TR", "Main_US", "Yabancı Oranı"
+    sheet_tr_name, sheet_yab_name = "Main_TR", "Yabancı Oranı"
     if not os.path.exists(file_name): print(f"Hata: '{file_name}' dosyası bulunamadı!"); return
     wb = load_workbook(file_name)
 
-    tr_tasks, us_tasks = [], []
+    tr_tasks = []
     date_a, date_b = "01-01-2024", "01-01-2024" # Varsayılan (eğer sayfa yoksa)
     
     # TR Hisse Listesi
@@ -342,37 +309,28 @@ def main_automation():
         else:
             date_a, date_b = "01-01-2024", "01-01-2024"
 
-    # US Görevlerini Topla
-    if sheet_us_name in wb.sheetnames:
-        ws_us = wb[sheet_us_name]
-        for r in range(2, ws_us.max_row + 1):
-            if ws_us.cell(row=r, column=1).value: us_tasks.append((r, ws_us.cell(row=r, column=1).value, ws_us.cell(row=r, column=2).value))
-
-    print(f"\n🚀 Belleğe Alınıyor... TR: {len(tr_tasks)} şirket | US: {len(us_tasks)} şirket")
+    print(f"\n🚀 Belleğe Alınıyor... TR: {len(tr_tasks)} şirket")
 
     # ==============================================================
-    # 3 AYRI MOTOR — HER API KENDİ THREAD HAVUZUNU KULLANIR
+    # 2 AYRI MOTOR — HER API KENDİ THREAD HAVUZUNU KULLANIR
     # ==============================================================
     
     _t_start = time.perf_counter()
 
     executor_tr  = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="TR-Mali")
     executor_yab = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="Yabanci")
-    executor_us  = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="US")
 
     # Her motor kendi görevlerini alır
     futures_tr  = {executor_tr.submit(task_tr_stock, r, sym): ('TR', sym) for r, sym in tr_tasks}
     futures_yab = {executor_yab.submit(task_yabanci_oran, r, sym, date_a, date_b): ('YAB', sym) for r, sym in tr_tasks}
-    futures_us  = {executor_us.submit(task_us_stock, r, sym, p): ('US', sym) for r, sym, p in us_tasks}
 
     all_futures = {}
     all_futures.update(futures_tr)
     all_futures.update(futures_yab)
-    all_futures.update(futures_us)
 
-    total_tr, total_yab, total_us = len(futures_tr), len(futures_yab), len(futures_us)
-    done_tr, done_yab, done_us = 0, 0, 0
-    total_all = total_tr + total_yab + total_us
+    total_tr, total_yab = len(futures_tr), len(futures_yab)
+    done_tr, done_yab = 0, 0
+    total_all = total_tr + total_yab
     done_all = 0
     last_sym = ""
 
@@ -387,7 +345,6 @@ def main_automation():
             f"\r  ⏳ {pct:5.1f}% {_bar(done_all, total_all, 20)} "
             f"│ TR Mali: {done_tr}/{total_tr} "
             f"│ Yabancı: {done_yab}/{total_yab} "
-            f"│ US: {done_us}/{total_us} "
             f"│ ⏱ {elapsed:.1f}s "
             f"│ Son: {last_sym:<10}"
         )
@@ -396,7 +353,7 @@ def main_automation():
 
     _print_progress()
 
-    tr_fin_results_map, tr_yab_results_map, us_results_map = {}, {}, {}
+    tr_fin_results_map, tr_yab_results_map = {}, {}
 
     for future in concurrent.futures.as_completed(all_futures):
         task_type, sym = all_futures[future]
@@ -409,20 +366,15 @@ def main_automation():
         elif task_type == 'YAB':
             tr_yab_results_map[sym] = result
             done_yab += 1
-        else:
-            us_results_map[sym] = result
-            done_us += 1
 
         done_all += 1
         _print_progress()
 
     executor_tr.shutdown(wait=False)
     executor_yab.shutdown(wait=False)
-    executor_us.shutdown(wait=False)
 
     tr_fin_results = [tr_fin_results_map[sym] for _, sym in tr_tasks]
     tr_yab_results = [tr_yab_results_map[sym] for _, sym in tr_tasks]
-    us_results = [us_results_map[sym] for _, sym, _ in us_tasks]
 
     elapsed_total = time.perf_counter() - _t_start
     print(f"\n\n✅ Tüm veriler RAM'e çekildi ({elapsed_total:.1f}s). Excel'e formatlanarak yazılıyor...\n")
@@ -553,30 +505,6 @@ def main_automation():
             if isinstance(c_price.value, (int, float)): c_price.number_format = '#,##0.00'
             for c in [c_start, c_end, c_change, c_effect]:
                 if isinstance(c.value, (int, float)): c.number_format = '0.00%'
-
-    # US Yazma
-    if sheet_us_name in wb.sheetnames:
-        ws_us = wb[sheet_us_name]
-        headers_us = {1: "Ticker", 2: "Dönem", 3: "Borç / Özsermaye", 4: "Faaliyet Kârı", 5: "Nakit Akışı"}
-        for col_num, text in headers_us.items(): ws_us.cell(row=1, column=col_num, value=text)
-
-        for res in us_results:
-            r, sym, d = res['row_idx'], res['symbol'], res['data']
-            ws_us.cell(row=r, column=1, value=sym)
-            ws_us.cell(row=r, column=2, value=d['resolved_period'])
-            
-            c3 = ws_us.cell(row=r, column=3, value=d['debt_equity'])
-            if isinstance(d['debt_equity'], (int, float)): c3.number_format = '0.00'
-            
-            c4 = ws_us.cell(row=r, column=4, value=d['op_income'])
-            if isinstance(d['op_income'], (int, float)): c4.number_format = '#,##0'
-            
-            c5 = ws_us.cell(row=r, column=5, value=d['op_cash_flow'])
-            if isinstance(d['op_cash_flow'], (int, float)): c5.number_format = '#,##0'
-
-            c3.fill = green_fill if isinstance(d['debt_equity'], (int, float)) and d['debt_equity'] < 1.0 else no_fill
-            c4.fill = green_fill if isinstance(d['op_income'], (int, float)) and d['op_income'] > 0 else no_fill
-            c5.fill = green_fill if isinstance(d['op_cash_flow'], (int, float)) and d['op_cash_flow'] > 0 else no_fill
 
     wb.save(file_name)
     print(f"✅ Excel dosyası başarıyla güncellendi ve kapatıldı!")
