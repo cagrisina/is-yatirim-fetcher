@@ -10,6 +10,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import concurrent.futures
 import datetime
+import yfinance as yf
 
 # ==============================================================================
 # 0. PAYLAŞIMLI HTTP SESSION (BÜYÜK CONNECTION POOL)
@@ -58,14 +59,19 @@ def fetch_tr_raw_data(symbol, period_val=None):
     clean_symbol = symbol.split('.')[0].strip().upper()
     url = "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/Common/Data.aspx/MaliTablo"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
-    fin_groups = ["XI_29", "UFRS", "UFRS_K"] 
+    fin_groups = ["XI_29", "UFRS_K", "UFRS"] 
 
-    now = datetime.datetime.now()
-    y, m = now.year, now.month
-    q = 9 if m >= 11 else 6 if m >= 8 else 3 if m >= 5 else 12
-    if q == 12: y -= 1
+    if period_val is not None:
+        y, q = period_val
+        attempts = 1
+    else:
+        now = datetime.datetime.now()
+        y, m = now.year, now.month
+        q = 9 if m >= 11 else 6 if m >= 8 else 3 if m >= 5 else 12
+        if q == 12: y -= 1
+        attempts = 4
     
-    for attempt in range(4):
+    for attempt in range(attempts):
         periods_list, resolved_name, is_partial = build_ttm_periods(y, q)
         for group in fin_groups:
             params = {"companyCode": clean_symbol, "exchange": "TRY", "financialGroup": group}
@@ -78,10 +84,12 @@ def fetch_tr_raw_data(symbol, period_val=None):
                     if "value" in data and data["value"]:
                         df = pd.DataFrame(data["value"])
                         if not df[df['itemDescTr'].str.contains("Özkaynak|Sermaye", case=False, na=False)].empty:
-                            return df, f"{resolved_name} (En Güncel)", is_partial, group
+                            ret_name = resolved_name if period_val is not None else f"{resolved_name} (En Güncel)"
+                            return df, ret_name, is_partial, group
             except: pass
-        q -= 3
-        if q <= 0: q = 12; y -= 1
+        if period_val is None:
+            q -= 3
+            if q <= 0: q = 12; y -= 1
     return None, "Bulunamadı", False, None
 
 def extract_tr_value(df, keyword_contains, regex=False):
@@ -273,10 +281,79 @@ def task_tr_stock(row_idx, symbol):
     df_raw, resolved_p, is_partial, group = fetch_tr_raw_data(symbol) # period_val ignored
     result = parse_tr_data(df_raw, resolved_p, is_partial, group)
     if result is None: result = {k: "" for k in ['debt_equity', 'op_income_ttm', 'op_income_q', 'op_cash_flow_ttm', 'op_cash_flow_q', 'net_fx', 'export_ratio_ttm', 'export_ratio_q', 'resolved_period', 'item_2oa', 'ozk', 'net_borc', 'favok_ttm', 'favok_q']}
+    
+    try:
+        info = yf.Ticker(symbol + ".IS").info
+        result['industry'] = info.get('industry', '')
+    except Exception:
+        result['industry'] = ''
+        
     return {'row_idx': row_idx, 'symbol': symbol, 'data': result}
 
 def task_yabanci_oran(row_idx, symbol, date_a, date_b):
     return {'row_idx': row_idx, 'symbol': symbol, 'data': fetch_yabanci_oran(symbol, date_a, date_b)}
+
+def task_historical_q(row_idx, symbol, periods):
+    results = []
+    df_raw, resolved_p, is_partial, group = fetch_tr_raw_data(symbol)
+    if df_raw is None:
+        return {'row_idx': row_idx, 'symbol': symbol, 'data': []}
+    
+    def get_hist_price(t_sym, year, month):
+        try:
+            next_month = month + 1 if month < 12 else 1
+            next_year = year if month < 12 else year + 1
+            data = yf.Ticker(f"{t_sym}.IS").history(start=f"{year}-{month:02d}-01", end=f"{next_year}-{next_month:02d}-01")
+            if not data.empty: return float(data['Close'].iloc[-1])
+        except: pass
+        return ""
+
+    def get_hist_yabanci(t_sym, year, month):
+        import pandas as pd
+        if month in [1, 3, 5, 7, 8, 10, 12]: day = 31
+        elif month in [4, 6, 9, 11]: day = 30
+        else: day = 29 if year % 4 == 0 else 28
+        
+        base_date = pd.Timestamp(year=year, month=month, day=day)
+        
+        for i in range(7):
+            test_date = base_date - pd.Timedelta(days=i)
+            d_str = test_date.strftime("%d-%m-%Y")
+            res = fetch_yabanci_oran(t_sym, d_str, d_str)
+            if res.get("end", "") != "":
+                return res.get("end")
+        return ""
+
+    first_res = parse_tr_data(df_raw, resolved_p, is_partial, group)
+    
+    try:
+        parts = resolved_p.split('/')[0:2]
+        y = int(re.sub(r'\D', '', parts[0]))
+        q = int(re.sub(r'\D', '', parts[1].split()[0]))
+    except:
+        if first_res: results.append(first_res)
+        return {'row_idx': row_idx, 'symbol': symbol, 'data': results}
+    
+    if first_res:
+        first_res['historical_price'] = get_hist_price(symbol, y, q)
+        first_res['historical_yabanci'] = get_hist_yabanci(symbol, y, q)
+        results.append(first_res)
+    
+    for _ in range(periods - 1):
+        q -= 3
+        if q <= 0:
+            q = 12
+            y -= 1
+        
+        df_hist, resolved_h, partial_h, group_h = fetch_tr_raw_data(symbol, period_val=(y, q))
+        if df_hist is not None:
+            res_hist = parse_tr_data(df_hist, resolved_h, partial_h, group_h)
+            if res_hist:
+                res_hist['historical_price'] = get_hist_price(symbol, y, q)
+                res_hist['historical_yabanci'] = get_hist_yabanci(symbol, y, q)
+                results.append(res_hist)
+    
+    return {'row_idx': row_idx, 'symbol': symbol, 'data': results}
 
 
 # ==============================================================================
@@ -289,11 +366,31 @@ def main_automation():
     if not os.path.exists(file_name): print(f"Hata: '{file_name}' dosyası bulunamadı!"); return
     wb = load_workbook(file_name)
 
+    # İşlemlere başlamadan önce tüm hücrelerin arka plan rengini (highlight) temizle
+    clear_fill = PatternFill(fill_type=None)
+    for sheet_name in wb.sheetnames:
+        for row in wb[sheet_name].iter_rows():
+            for cell in row:
+                cell.fill = clear_fill
+
     tr_tasks = []
+    hist_q_tasks = []
     date_a, date_b = "01-01-2024", "01-01-2024" # Varsayılan (eğer sayfa yoksa)
     
+    if "analyze_input" in wb.sheetnames:
+        ws_input = wb["analyze_input"]
+        for row in range(2, ws_input.max_row + 1):
+            hedef = str(ws_input.cell(row=row, column=1).value or "").strip()
+            ticker = str(ws_input.cell(row=row, column=2).value or "").strip()
+            donem = ws_input.cell(row=row, column=3).value
+            if hedef == "Historical_Q" and ticker and donem:
+                try: donem_int = int(donem)
+                except: donem_int = 0
+                if donem_int > 0:
+                    hist_q_tasks.append((row, ticker, donem_int))
+
     # TR Hisse Listesi
-    sheet_tr_name = "Main_TR_TTM" if "Main_TR_TTM" in wb.sheetnames else "Main_TR"
+    sheet_tr_name = "Main_TR_Q" if "Main_TR_Q" in wb.sheetnames else "Main_TR"
     if sheet_tr_name in wb.sheetnames:
         ws_tr = wb[sheet_tr_name]
         for row in range(2, ws_tr.max_row + 1):
@@ -319,18 +416,21 @@ def main_automation():
 
     executor_tr  = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="TR-Mali")
     executor_yab = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="Yabanci")
+    executor_hist = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="Hist-Q")
 
     # Her motor kendi görevlerini alır
     futures_tr  = {executor_tr.submit(task_tr_stock, r, sym): ('TR', sym) for r, sym in tr_tasks}
     futures_yab = {executor_yab.submit(task_yabanci_oran, r, sym, date_a, date_b): ('YAB', sym) for r, sym in tr_tasks}
+    futures_hist = {executor_hist.submit(task_historical_q, r, sym, p): ('HIST_Q', sym) for r, sym, p in hist_q_tasks}
 
     all_futures = {}
     all_futures.update(futures_tr)
     all_futures.update(futures_yab)
+    all_futures.update(futures_hist)
 
-    total_tr, total_yab = len(futures_tr), len(futures_yab)
-    done_tr, done_yab = 0, 0
-    total_all = total_tr + total_yab
+    total_tr, total_yab, total_hist = len(futures_tr), len(futures_yab), len(futures_hist)
+    done_tr, done_yab, done_hist = 0, 0, 0
+    total_all = total_tr + total_yab + total_hist
     done_all = 0
     last_sym = ""
 
@@ -345,6 +445,7 @@ def main_automation():
             f"\r  ⏳ {pct:5.1f}% {_bar(done_all, total_all, 20)} "
             f"│ TR Mali: {done_tr}/{total_tr} "
             f"│ Yabancı: {done_yab}/{total_yab} "
+            f"│ Hist-Q: {done_hist}/{total_hist} "
             f"│ ⏱ {elapsed:.1f}s "
             f"│ Son: {last_sym:<10}"
         )
@@ -353,7 +454,7 @@ def main_automation():
 
     _print_progress()
 
-    tr_fin_results_map, tr_yab_results_map = {}, {}
+    tr_fin_results_map, tr_yab_results_map, hist_q_results_map = {}, {}, {}
 
     for future in concurrent.futures.as_completed(all_futures):
         task_type, sym = all_futures[future]
@@ -366,15 +467,20 @@ def main_automation():
         elif task_type == 'YAB':
             tr_yab_results_map[sym] = result
             done_yab += 1
+        elif task_type == 'HIST_Q':
+            hist_q_results_map[sym] = result
+            done_hist += 1
 
         done_all += 1
         _print_progress()
 
     executor_tr.shutdown(wait=False)
     executor_yab.shutdown(wait=False)
+    executor_hist.shutdown(wait=False)
 
     tr_fin_results = [tr_fin_results_map[sym] for _, sym in tr_tasks]
     tr_yab_results = [tr_yab_results_map[sym] for _, sym in tr_tasks]
+    hist_q_results = [hist_q_results_map[sym] for _, sym, _ in hist_q_tasks]
 
     elapsed_total = time.perf_counter() - _t_start
     print(f"\n\n✅ Tüm veriler RAM'e çekildi ({elapsed_total:.1f}s). Excel'e formatlanarak yazılıyor...\n")
@@ -387,7 +493,7 @@ def main_automation():
     
     yab_dict = {res['symbol']: res['data'] for res in tr_yab_results}
 
-    sheet_tr_ttm_name = "Main_TR_TTM"
+    sheet_tr_ttm_name = "TR_TTM"
     sheet_tr_q_name = "Main_TR_Q"
 
     if sheet_tr_ttm_name not in wb.sheetnames: wb.create_sheet(sheet_tr_ttm_name)
@@ -397,18 +503,18 @@ def main_automation():
     ws_q = wb[sheet_tr_q_name]
 
     headers_ttm = {
-        1: "Ticker", 2: "Dönem", 3: "Borç / Özsermaye", 4: "Faaliyet Kârı (TTM)", 
-        5: "Nakit Akışı (TTM)", 6: "Net Döviz Pozisyonu", 7: "İhracat Geliri (TTM)", 
-        8: "Yabancı Oranı", 9: "Yabancı Oranı Değişim",
-        10: "Piyasa Değeri", 11: "PD/DD",
-        12: "FAVÖK (TTM)", 13: "FD / FAVÖK (TTM)"
+        1: "Ticker", 2: "Sektör", 3: "Dönem", 4: "Borç / Özsermaye", 5: "Faaliyet Kârı (TTM)", 
+        6: "Nakit Akışı (TTM)", 7: "Net Döviz Pozisyonu", 8: "İhracat Geliri (TTM)", 
+        9: "Yabancı Oranı", 10: "Yabancı Oranı Değişim",
+        11: "Piyasa Değeri", 12: "PD/DD",
+        13: "FAVÖK (TTM)", 14: "FD / FAVÖK (TTM)"
     }
     headers_q = {
-        1: "Ticker", 2: "Dönem", 3: "Borç / Özsermaye", 4: "Faaliyet Kârı (Q)", 
-        5: "Nakit Akışı (Q)", 6: "Net Döviz Pozisyonu", 7: "İhracat Geliri (Q)", 
-        8: "Yabancı Oranı", 9: "Yabancı Oranı Değişim",
-        10: "Piyasa Değeri", 11: "PD/DD",
-        12: "FAVÖK (Q)", 13: "FD / FAVÖK (Yıllıklandırılmış Q)"
+        1: "Ticker", 2: "Sektör", 3: "Dönem", 4: "Borç / Özsermaye", 5: "Faaliyet Kârı (Q)", 
+        6: "Nakit Akışı (Q)", 7: "Net Döviz Pozisyonu", 8: "İhracat Geliri (Q)", 
+        9: "Yabancı Oranı", 10: "Yabancı Oranı Değişim",
+        11: "Piyasa Değeri", 12: "PD/DD",
+        13: "FAVÖK (Q)", 14: "FD / FAVÖK (Yıllıklandırılmış Q)"
     }
 
     for col_num, text in headers_ttm.items(): ws_ttm.cell(row=1, column=col_num, value=text)
@@ -434,38 +540,39 @@ def main_automation():
 
         def write_row(ws, suffix, is_q=False):
             ws.cell(row=r, column=1, value=sym)
-            ws.cell(row=r, column=2, value=d['resolved_period'])
+            ws.cell(row=r, column=2, value=d.get('industry', ''))
+            ws.cell(row=r, column=3, value=d['resolved_period'])
             
-            c3 = ws.cell(row=r, column=3, value=d['debt_equity'])
-            if isinstance(c3.value, (int, float)): c3.number_format = '0.00'
+            c4 = ws.cell(row=r, column=4, value=d['debt_equity'])
+            if isinstance(c4.value, (int, float)): c4.number_format = '0.00'
             
-            c4 = ws.cell(row=r, column=4, value=d.get(f'op_income_{suffix}', ''))
-            if isinstance(c4.value, (int, float)): c4.number_format = '#,##0'
-            
-            c5 = ws.cell(row=r, column=5, value=d.get(f'op_cash_flow_{suffix}', ''))
+            c5 = ws.cell(row=r, column=5, value=d.get(f'op_income_{suffix}', ''))
             if isinstance(c5.value, (int, float)): c5.number_format = '#,##0'
             
-            c6 = ws.cell(row=r, column=6, value=d.get('net_fx', ''))
+            c6 = ws.cell(row=r, column=6, value=d.get(f'op_cash_flow_{suffix}', ''))
             if isinstance(c6.value, (int, float)): c6.number_format = '#,##0'
             
-            c7 = ws.cell(row=r, column=7, value=d.get(f'export_ratio_{suffix}', ''))
-            if isinstance(c7.value, (int, float)): c7.number_format = '0.00%'
+            c7 = ws.cell(row=r, column=7, value=d.get('net_fx', ''))
+            if isinstance(c7.value, (int, float)): c7.number_format = '#,##0'
             
-            c8 = ws.cell(row=r, column=8, value=yab_end)
+            c8 = ws.cell(row=r, column=8, value=d.get(f'export_ratio_{suffix}', ''))
             if isinstance(c8.value, (int, float)): c8.number_format = '0.00%'
             
-            c9 = ws.cell(row=r, column=9, value=yab_change)
+            c9 = ws.cell(row=r, column=9, value=yab_end)
             if isinstance(c9.value, (int, float)): c9.number_format = '0.00%'
+            
+            c10 = ws.cell(row=r, column=10, value=yab_change)
+            if isinstance(c10.value, (int, float)): c10.number_format = '0.00%'
 
-            c10 = ws.cell(row=r, column=10, value=piyasa_degeri)
-            if isinstance(c10.value, (int, float)): c10.number_format = '#,##0'
+            c11 = ws.cell(row=r, column=11, value=piyasa_degeri)
+            if isinstance(c11.value, (int, float)): c11.number_format = '#,##0'
 
-            c11 = ws.cell(row=r, column=11, value=pddd)
-            if isinstance(c11.value, (int, float)): c11.number_format = '0.00'
+            c12 = ws.cell(row=r, column=12, value=pddd)
+            if isinstance(c12.value, (int, float)): c12.number_format = '0.00'
 
             favok = d.get(f'favok_{suffix}', "")
-            c12 = ws.cell(row=r, column=12, value=favok)
-            if isinstance(c12.value, (int, float)): c12.number_format = '#,##0'
+            c13 = ws.cell(row=r, column=13, value=favok)
+            if isinstance(c13.value, (int, float)): c13.number_format = '#,##0'
 
             fd_favok = ""
             if isinstance(piyasa_degeri, (int, float)) and isinstance(net_borc, (int, float)):
@@ -476,13 +583,13 @@ def main_automation():
                     else:
                         fd_favok = fd / favok
             
-            c13 = ws.cell(row=r, column=13, value=fd_favok)
-            if isinstance(c13.value, (int, float)): c13.number_format = '0.00'
+            c14 = ws.cell(row=r, column=14, value=fd_favok)
+            if isinstance(c14.value, (int, float)): c14.number_format = '0.00'
 
-            c3.fill = green_fill if not is_b and isinstance(c3.value, (int, float)) and c3.value < 1.0 else no_fill
-            c4.fill = green_fill if isinstance(c4.value, (int, float)) and c4.value > 0 else no_fill
+            c4.fill = green_fill if not is_b and isinstance(c4.value, (int, float)) and c4.value < 1.0 else no_fill
             c5.fill = green_fill if isinstance(c5.value, (int, float)) and c5.value > 0 else no_fill
-            c6.fill = green_fill if not is_b and isinstance(c6.value, (int, float)) and c6.value > 0 else no_fill
+            c6.fill = green_fill if isinstance(c6.value, (int, float)) and c6.value > 0 else no_fill
+            c7.fill = green_fill if not is_b and isinstance(c7.value, (int, float)) and c7.value > 0 else no_fill
 
         write_row(ws_ttm, 'ttm', is_q=False)
         write_row(ws_q, 'q', is_q=True)
@@ -505,6 +612,91 @@ def main_automation():
             if isinstance(c_price.value, (int, float)): c_price.number_format = '#,##0.00'
             for c in [c_start, c_end, c_change, c_effect]:
                 if isinstance(c.value, (int, float)): c.number_format = '0.00%'
+
+    # Historical_Q Sayfasını Yazma
+    if hist_q_tasks:
+        sheet_hist_name = "Historical_Q"
+        if sheet_hist_name not in wb.sheetnames: wb.create_sheet(sheet_hist_name)
+        ws_hist = wb[sheet_hist_name]
+        
+        headers_hist = {
+            1: "Ticker", 2: "Sektör", 3: "Dönem", 4: "Borç / Özsermaye", 5: "Faaliyet Kârı (Q)", 
+            6: "Nakit Akışı (Q)", 7: "Net Döviz Pozisyonu", 8: "İhracat Geliri (Q)", 
+            9: "Yabancı Oranı", 10: "Yabancı Oranı Değişim",
+            11: "Piyasa Değeri", 12: "PD/DD",
+            13: "FAVÖK (Q)", 14: "FD / FAVÖK (Yıllıklandırılmış Q)"
+        }
+        for col_num, text in headers_hist.items(): ws_hist.cell(row=1, column=col_num, value=text)
+        
+        curr_row = 2
+        for res_task in hist_q_results:
+            sym = res_task['symbol']
+            hist_data_list = res_task['data']
+            
+            for d in hist_data_list:
+                is_b = d.get('is_bank', False)
+                ws_hist.cell(row=curr_row, column=1, value=sym)
+                ws_hist.cell(row=curr_row, column=2, value=d.get('industry', ''))
+                ws_hist.cell(row=curr_row, column=3, value=d['resolved_period'])
+                
+                c4 = ws_hist.cell(row=curr_row, column=4, value=d['debt_equity'])
+                if isinstance(c4.value, (int, float)): c4.number_format = '0.00'
+                
+                c5 = ws_hist.cell(row=curr_row, column=5, value=d.get('op_income_q', ''))
+                if isinstance(c5.value, (int, float)): c5.number_format = '#,##0'
+                
+                c6 = ws_hist.cell(row=curr_row, column=6, value=d.get('op_cash_flow_q', ''))
+                if isinstance(c6.value, (int, float)): c6.number_format = '#,##0'
+                
+                c7 = ws_hist.cell(row=curr_row, column=7, value=d.get('net_fx', ''))
+                if isinstance(c7.value, (int, float)): c7.number_format = '#,##0'
+                
+                c8 = ws_hist.cell(row=curr_row, column=8, value=d.get('export_ratio_q', ''))
+                if isinstance(c8.value, (int, float)): c8.number_format = '0.00%'
+                
+                historical_price = d.get('historical_price', "")
+                item_2oa = d.get('item_2oa', "")
+                ozk = d.get('ozk', "")
+                net_borc = d.get('net_borc', "")
+                favok = d.get('favok_q', "")
+                
+                piyasa_degeri = ""
+                pddd = ""
+                if isinstance(historical_price, (int, float)) and isinstance(item_2oa, (int, float)):
+                    piyasa_degeri = historical_price * item_2oa
+                    if isinstance(ozk, (int, float)) and ozk != 0:
+                        pddd = piyasa_degeri / ozk
+                
+                fd_favok = ""
+                if isinstance(piyasa_degeri, (int, float)) and isinstance(net_borc, (int, float)):
+                    fd = piyasa_degeri + net_borc
+                    if isinstance(favok, (int, float)) and favok != 0:
+                        fd_favok = fd / (favok * 4)
+
+                historical_yabanci = d.get('historical_yabanci', "")
+                c9 = ws_hist.cell(row=curr_row, column=9, value=historical_yabanci)
+                if isinstance(c9.value, (int, float)): c9.number_format = '0.00%'
+                
+                ws_hist.cell(row=curr_row, column=10, value="")
+                
+                c11 = ws_hist.cell(row=curr_row, column=11, value=piyasa_degeri)
+                if isinstance(c11.value, (int, float)): c11.number_format = '#,##0'
+                
+                c12 = ws_hist.cell(row=curr_row, column=12, value=pddd)
+                if isinstance(c12.value, (int, float)): c12.number_format = '0.00'
+                
+                c13 = ws_hist.cell(row=curr_row, column=13, value=favok)
+                if isinstance(c13.value, (int, float)): c13.number_format = '#,##0'
+                
+                c14 = ws_hist.cell(row=curr_row, column=14, value=fd_favok)
+                if isinstance(c14.value, (int, float)): c14.number_format = '0.00'
+                
+                c4.fill = green_fill if not is_b and isinstance(c4.value, (int, float)) and c4.value < 1.0 else no_fill
+                c5.fill = green_fill if isinstance(c5.value, (int, float)) and c5.value > 0 else no_fill
+                c6.fill = green_fill if isinstance(c6.value, (int, float)) and c6.value > 0 else no_fill
+                c7.fill = green_fill if not is_b and isinstance(c7.value, (int, float)) and c7.value > 0 else no_fill
+                
+                curr_row += 1
 
     wb.save(file_name)
     print(f"✅ Excel dosyası başarıyla güncellendi ve kapatıldı!")
