@@ -1,0 +1,69 @@
+
+18.05.2026 00:03
+En sonki problem API verisi çekerken son 4 çeyreği çekip çekmediğine emin olamadım. (bu sorun çözüldü) FAVÖK yıllaklandırılmış bakılıyor ttm değil ise yani firma değeri / 4* favök
+
+bir sonraki plan, tarihsel bir sheet aç ve seçili hisselerin tarihsel olarak oranlarına bakalım
+
+
+
+Aşağıdaki rasyolar eklenecek:
+https://gemini.google.com/u/1/app/2409169691496c83?hl=tr
+
+Haklısın, önceki listedeki yabancı takası piyasa ekranından, bankacılık rasyoları ise BDDK raporlarından takip edilen veriler. Stratejini tamamen **Bilanço, Gelir Tablosu ve Nakit Akış Tablosu** kalemleriyle beslemek ve bu verileri Excel'e/Python'a doğrudan girilebilir hale getirmek çok daha pratik bir yol.
+
+Sorduğun piyasa çarpanları (**FK, PD/DD, FD/FAVÖK ve Piyasa Değeri**) bu 2 yıllık stratejide senin **"emniyet supabın"** olacak. Şirket mali olarak çok güçlü olabilir ama fiyatı ederinin çok üzerindeyse 2 yıl sonra beklediğin o ATH (Zirve) rallisini yapamaz.
+
+Bu çarpanların seçim ekonomisindeki rollerini ve mali tablolardan doğrudan çekebileceğin net kalemleri bir araya getirelim.
+
+---
+
+## 1. Piyasa Çarpanları Seçim Ekonomisinde Nasıl İşine Yarar?
+
+| Çarpan | Seçim Ekonomisindeki Kritik Rolü | Nasıl Kullanmalısın? |
+| --- | --- | --- |
+| **FD / FAVÖK** <br>
+
+<br>*(Firma Değeri / FAVÖK)* | **Bu stratejinin kralıdır.** Şirketin piyasa değerine borçlarını ekleyip kasasındaki nakdi çıkarır ve bunu net esas faaliyet kârına böler. | Türkiye'de enflasyon muhasebesi (TMS 29) net kârı çok manipüle ediyor. Bu yüzden FK yerine bu çarpana bakmalısın. Sektör ortalamasının altındaysa "ucuzdur". |
+| **PD / DD** <br>
+
+<br>*(Piyasa Değeri / Defter Değeri)* | Videoda bahsedilen **GYO, İnşaat ve Holding** sektörleri için en hayati çarpandır. | Seçim öncesi faizler düştüğünde bu şirketlerin ellerindeki arsaların, binaların ve iştiraklerin değeri (özsermayesi) katlanır. PD/DD oranı 1'in (hatta mümkünse 0.5'in) altında olan dev holding ve GYO'lar ralli potansiyeli en yüksek olanlardır. |
+| **F / K** <br>
+
+<br>*(Fiyat / Kazanç)* | Perakende (BİM, Migros) ve Otomotiv (Ford, Tofaş) gibi nakit döngüsü hızlı, net kârı net olan sektörlerde işe yarar. | Tek başına yanıltıcı olabilir. Sadece "Çok yüksek FK'lı şirketleri elemek" (örneğin FK > 25 olanları listenden çıkarmak) için bir filtre olarak kullanabilirsin. |
+| **Piyasa Değeri (Market Cap)** | Likidite filtresidir. Videoda "Para basıldığında yabancı büyük yapılara gelir" deniyor. | Portföyünün seçim öncesi devasa para girişlerinden pay alabilmesi için çok küçük (yan tahta) şirketler yerine, Piyasa Değeri yüksek (BIST 30 veya BIST 50) şirketlere odaklanmalısın. |
+
+---
+
+## 2. Mali Tablolardan (Bilanço/Gelir) Doğrudan Çıkan "Must" Kalemler
+
+Videodaki "kredi genişlemesi ve faiz indirimi" teorisini yakalamak için bilanço ve gelir tablosundan doğrudan çekebileceğin, Excel'de kolayca formüle edebileceğin 4 veri:
+
+### 1. Müşterilerden Alınan Avanslar (Bilanço - Kısa Vadeli Yükümlülükler Altında)
+
+* **Teorideki Yeri:** Faizler düştüğünde ve piyasaya para pompalandığında konut, otomobil veya beyaz eşya almak isteyenler bayilere akın eder ve kapora/peşinat yatırır.
+* **Formül / Takip:** Bilançonun pasif tarafındaki "Müşterilerden Alınan Avanslar" kalemi çeyreklik olarak hızla artan şirket, önümüzdeki aylarda yapacağı devasa satışları önden haber veriyor demektir. Bu, sıfır faizli muazzam bir kaynaktır.
+
+### 2. Net Finansal Borç / FAVÖK (Bilanço + Gelir Tablosu)
+
+* **Formül:** `(Kısa Vadeli Finansal Borçlar + Uzun Vadeli Finansal Borçlar - Nakit ve Nakit Benzerleri) / FAVÖK`
+* **Teorideki Yeri:** Bu oran şirketlerin finansal sağlık borometresidir. Seçim öncesi faizler düşecekse, şu an borç yükü (oranı 3'ün üzerinde olan) yüksek ama iş modeli sağlam şirketler faiz indirimlerinden **en çok kâr patlaması yaşayacak** olanlardır. Oranın 1'in altında olması ise tam bir defansif kaledir.
+
+### 3. Net İşletme Sermayesi (Bilanço)
+
+* **Formül:** `Dönen Varlıklar - Kısa Vadeli Yükümlülükler`
+* **Teorideki Yeri:** Seçim ekonomisinin ilk evresinde (para pompalanırken) sorun yok ama seçim bittiği an piyasada ani bir likidite kuraklığı yaşanır (Videodaki 2018 ve 2023 örnekleri gibi). Net İşletme Sermayesi pozitif ve güçlü olan şirketler, seçim sonrasındaki o sert kriz evresinde batmaz, aksine pazar payını büyütür.
+
+### 4. Esas Faaliyet Nakit Akışı / Net Kâr (Nakit Akış Tablosu + Gelir Tablosu)
+
+* **Formül:** Nakit Akış Tablosundaki `Esas Faaliyetlerden Elde Edilen Nakit Akışları / Dönem Net Kârı`
+* **Teorideki Yeri:** Hedefin 2 yıllık bir biriktirme planı olduğu için kâğıt üstünde kâr eden değil, kasasına gerçekten nakit giren şirketleri bulmalısın. Bu oran 1'e ne kadar yakın veya 1'den büyükse, şirketin kârı o kadar "gerçek ve organiktir".
+
+---
+
+## 3. Haftalık Takip İçin Stratejik Öneri
+
+Haftalık veri kontrolü yaparken fiyat hareketleri çarpanları (**FK, PD/DD, FD/FAVÖK**) sürekli değiştirecektir çünkü hisse fiyatı her gün değişir. Ancak bilanço kalemleri (**Avanslar, Borçlar, İşletme Sermayesi**) sadece 3 ayda bir (çeyreklik bilançolar açıklandıkça) güncellenir.
+
+Bu yüzden kuracağın sistemde haftalık olarak **"Mali tablosu son çeyrekte güçlü gelmiş şirketlerin, bu hafta çarpanları bazında (fiyatı düştüğü için) ucuzlayıp ucuzlamadığına"** bakmalısın. Fiyat düştükçe çarpanı ucuzlayan "mali bizonları" yakaladığında, 2 yıllık parçalı alım listene ekleyebilirsin.
+
+Bu rasyoları tamamen sanayi/üretim ve hizmet sektörü için mi kullanacaksın, yoksa bankaları analiz dışı bırakıp tamamen bu holding-ticaret-üretim ekseninde mi ilerlemek istersiz?
