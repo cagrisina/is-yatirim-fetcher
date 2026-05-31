@@ -1,24 +1,30 @@
-# Excel sayfa yazımı: Config, Facts (uzun format), Sinyal (Excel 365 formülleri).
-# Sinyal için FILTER / LET / XLOOKUP kullanılır — Microsoft 365 gerekir.
+# Excel sayfa yazımı: Config, Raw_data (uzun format + anlık metrikler), Sinyal (Python ile hesaplanan değerler).
 
-from openpyxl.utils import get_column_letter
+import statistics
 
-FACTS_SHEET = "Facts"
-OZET_SHEET = "Özet"
-CONFIG_PERIOD_START_ROW = 1
-CONFIG_PERIOD_COL = 6  # F — dönem etiketleri (Config!F1:…)
-CONFIG_PERIOD_MAX_ROWS = 50
+from openpyxl.styles import PatternFill
 
-# Yeni metrik: (Excel Facts sütunu "Metrik" kodu, hist hücre üçlüsündeki indeks)
+_NO_FILL = PatternFill(fill_type=None)
+
+RAW_DATA_SHEET = "Raw_data"
+
+# (Raw_data "Metrik" kodu, hist hücre üçlüsündeki indeks: pddd, fd_favok, borc_ozk)
 METRICS = [
     ("PDDD", 0),
-    ("FDFAVOK", 1),
-    ("BORC", 2),
+    ("FD_FAVOK", 1),
+    ("BORC_OZK", 2),
 ]
+
+MANAGED_OUTPUT_SHEETS = ("Raw_data", "Yabancı Oranı", "Sinyal")
+
+# Eski kitaplarda kalan Config F dönem etiketleri — artık kullanılmıyor; her çalıştırmada temizlenir.
+_CONFIG_LEGACY_PERIOD_COL = 6
+_CONFIG_LEGACY_PERIOD_MAX_ROW = 50
 
 
 def ensure_config_sheet(wb):
     if "Config" in wb.sheetnames:
+        _clear_config_legacy_period_column(wb["Config"])
         return
     ws = wb.create_sheet("Config")
     ws["A1"], ws["B1"] = "analiz_donemi", 12
@@ -26,49 +32,80 @@ def ensure_config_sheet(wb):
     ws["A3"], ws["B3"] = "pahali_esik", 75
 
 
+def _clear_config_legacy_period_column(ws):
+    col = _CONFIG_LEGACY_PERIOD_COL
+    for r in range(1, _CONFIG_LEGACY_PERIOD_MAX_ROW + 1):
+        ws.cell(row=r, column=col, value=None)
+
+
+def read_config_signal_params(wb):
+    """Config!B1:B3 — analiz_donemi (çekilecek çeyrek sayısı + Sinyal penceresi / pct paydası), ucuz_esik, pahali_esik."""
+    ensure_config_sheet(wb)
+    ws = wb["Config"]
+
+    def _num(cell, default, as_int=False):
+        v = ws[cell].value
+        if v is None or v == "":
+            return default
+        try:
+            x = float(v)
+            return int(x) if as_int else x
+        except (TypeError, ValueError):
+            return default
+
+    return (
+        _num("B1", 12, as_int=True),
+        _num("B2", 25.0),
+        _num("B3", 75.0),
+    )
+
+
+def remove_facts_sheet_if_present(wb):
+    if "Facts" in wb.sheetnames:
+        wb.remove(wb["Facts"])
+
+
+def clear_managed_output_sheets_body(wb, max_row=5000, max_col=30):
+    """Main hariç kodun doldurduğu sayfalarda satır 2+ değer ve dolgu temizliği (başlık satırı korunur)."""
+    for name in MANAGED_OUTPUT_SHEETS:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        end_r = max(ws.max_row or 2, max_row)
+        for r in range(2, end_r + 1):
+            for c in range(1, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.value = None
+                cell.fill = _NO_FILL
+                cell.number_format = "General"
+
+
 def _clear_matrix_sheet(ws, max_row, max_col):
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
             cell = ws.cell(row=r, column=c)
             cell.value = None
+            cell.fill = _NO_FILL
             cell.number_format = "General"
 
 
-def _period_range_end_col_letter():
-    return get_column_letter(CONFIG_PERIOD_COL)
-
-
-def update_config_period_labels(wb, period_labels):
+def write_raw_data(wb, period_labels, matrix_rows, snapshot_rows):
     """
-    Config!F1:F* içine çeyrek etiketlerini yazar (en güncel üstte).
-    analiz_donemi (B1) ve diğer kullanıcı alanlarına dokunmaz.
-    """
-    if "Config" not in wb.sheetnames:
-        ensure_config_sheet(wb)
-    ws = wb["Config"]
-    col = CONFIG_PERIOD_COL
-    last = CONFIG_PERIOD_START_ROW + CONFIG_PERIOD_MAX_ROWS
-    for r in range(CONFIG_PERIOD_START_ROW, last + 1):
-        ws.cell(row=r, column=col, value=None)
-    for i, lbl in enumerate(period_labels[:CONFIG_PERIOD_MAX_ROWS]):
-        ws.cell(row=CONFIG_PERIOD_START_ROW + i, column=col, value=lbl)
+    Raw_data: Ticker | Metrik | Dönem | Değer (uzun format).
 
-
-def write_facts(wb, period_labels, matrix_rows):
-    """
-    matrix_rows: list of (row_idx, symbol, cells) where cells is length N list of
-                 (pddd, fd_favok, borc) each float or None.
-    Facts: Ticker | Metrik | Dönem | Değer (uzun format).
-    row_idx yalnızca Main_TR_Q satırıyla hizalama için taşınır; Facts satır sırasında kullanılmaz.
+    Önce çeyreklik geçmiş metrikler (PDDD, FD_FAVOK, BORC_OZK), sonra anlık snapshot satırları.
+    snapshot_rows: (ticker, metrik, dönem, değer, number_format_str|None) listesi.
     """
     n = len(period_labels)
-    if FACTS_SHEET not in wb.sheetnames:
-        wb.create_sheet(FACTS_SHEET)
-    ws = wb[FACTS_SHEET]
-
     n_metrics = len(METRICS)
-    data_rows = max(1, len(matrix_rows) * max(n, 1) * n_metrics)
-    _clear_matrix_sheet(ws, max(data_rows + 5, 500), 10)
+    snap_n = len(snapshot_rows)
+    data_rows = max(1, len(matrix_rows) * max(n, 1) * n_metrics) + snap_n + 5
+
+    if RAW_DATA_SHEET not in wb.sheetnames:
+        wb.create_sheet(RAW_DATA_SHEET)
+    ws = wb[RAW_DATA_SHEET]
+
+    _clear_matrix_sheet(ws, max(data_rows + 50, 500), 10)
 
     ws.cell(row=1, column=1, value="Ticker")
     ws.cell(row=1, column=2, value="Metrik")
@@ -76,7 +113,11 @@ def write_facts(wb, period_labels, matrix_rows):
     ws.cell(row=1, column=4, value="Değer")
 
     out_r = 2
+
     for _row_idx, symbol, cells in matrix_rows:
+        assert len(cells) == len(period_labels), (
+            f"Raw_data hizası: {symbol!r} cells={len(cells)} period_labels={len(period_labels)}"
+        )
         for j in range(n):
             period = period_labels[j] if j < len(period_labels) else ""
             trip = cells[j] if j < len(cells) else (None, None, None)
@@ -90,60 +131,90 @@ def write_facts(wb, period_labels, matrix_rows):
                     c.number_format = "0.00"
                 out_r += 1
 
-
-def _config_win_spill_ref():
-    """Dikey dönem penceresi: F1’den itibaren MIN(B1, dolu F sayısı) satır."""
-    col = _period_range_end_col_letter()
-    return (
-        f"OFFSET(Config!${col}${CONFIG_PERIOD_START_ROW},0,0,"
-        f"MIN(Config!$B$1,COUNTA(Config!${col}$"
-        f"{CONFIG_PERIOD_START_ROW}:"
-        f"${col}${CONFIG_PERIOD_START_ROW + CONFIG_PERIOD_MAX_ROWS - 1})),1)"
-    )
-
-
-def _facts_filter_v(metric_code: str, main_row: int) -> str:
-    win = _config_win_spill_ref()
-    return (
-        f"_xlfn.FILTER(Facts!$D:$D,(Facts!$A:$A=$A{main_row})*(Facts!$B:$B=\"{metric_code}\")"
-        f"*(ISNUMBER(MATCH(Facts!$C:$C,{win},0)))*(ISNUMBER(Facts!$D:$D)))"
-    )
+    for ticker, metrik, donem, deger, nf in snapshot_rows:
+        ws.cell(row=out_r, column=1, value=ticker)
+        ws.cell(row=out_r, column=2, value=metrik)
+        ws.cell(row=out_r, column=3, value=donem)
+        c = ws.cell(row=out_r, column=4, value=deger)
+        if nf and isinstance(deger, (int, float)):
+            c.number_format = nf
+        elif isinstance(deger, (int, float)):
+            c.number_format = "0.00"
+        out_r += 1
 
 
-def _facts_current_lookup(metric_code: str, main_row: int) -> str:
-    return (
-        f"_xlfn.LET(x,_xlfn.XLOOKUP(1,(Facts!$A:$A=$A{main_row})*(Facts!$B:$B=\"{metric_code}\")"
-        f"*(Facts!$C:$C=Config!${_period_range_end_col_letter()}${CONFIG_PERIOD_START_ROW}),"
-        f"Facts!$D:$D,\"\"),IF(ISNUMBER(x),x,\"\"))"
-    )
+def _metric_window_floats(cells, metric_idx, window_n):
+    out = []
+    for j in range(min(window_n, len(cells))):
+        trip = cells[j]
+        v = trip[metric_idx] if metric_idx < len(trip) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out.append(float(v))
+    return out
 
 
-def _facts_median_let(metric_code: str, main_row: int) -> str:
-    v = _facts_filter_v(metric_code, main_row)
-    return f"_xlfn.LET(v,{v},IFERROR(MEDIAN(v),\"\"))"
+def _current_metric(cells, metric_idx):
+    if not cells:
+        return None
+    trip = cells[0]
+    v = trip[metric_idx] if metric_idx < len(trip) else None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return None
 
 
-def _facts_pct_let(metric_code: str, main_row: int) -> str:
-    v = _facts_filter_v(metric_code, main_row)
-    cur = _facts_current_lookup(metric_code, main_row)
-    return (
-        f"_xlfn.LET(v,{v},cur,{cur},"
-        f"IF(OR(Config!$B$1<=0,NOT(ISNUMBER(cur))),\"\","
-        f"IFERROR(SUM(--(v<=cur))/Config!$B$1,\"\")))"
-    )
+def _median_or_none(vals):
+    if not vals:
+        return None
+    return float(statistics.median(vals))
 
 
-def write_sinyal_sheet(wb, tr_tasks, tr_fin_results_map):
+def _excel_style_pct_in_window(window_vals, cur, denom_b1):
+    """Eski Excel: SUM(--(v<=cur))/B1; payda her zaman analiz_donemi (B1)."""
+    if denom_b1 <= 0 or cur is None:
+        return None
+    cnt = sum(1 for v in window_vals if v <= cur)
+    return cnt / float(denom_b1)
+
+
+def _signal_ucuz_pahali_neutral(pct, ucuz_esik, pahali_esik):
+    if pct is None:
+        return ""
+    lo = ucuz_esik / 100.0
+    hi = pahali_esik / 100.0
+    if pct < lo:
+        return "UCUZ"
+    if pct > hi:
+        return "PAHALI"
+    return "NÖTR"
+
+
+def _genel_signal(score, ucuz_esik, pahali_esik):
+    if score is None:
+        return ""
+    if score > pahali_esik:
+        return "UCUZ"
+    if score < ucuz_esik:
+        return "PAHALI"
+    return "NÖTR"
+
+
+def write_sinyal_sheet(wb, tr_tasks, tr_fin_results_map, matrix_rows, period_labels):
     """
-    tr_tasks: [(row_idx, symbol), ...] — Main_TR_Q ile aynı satır numaraları.
-    Facts + Config (F sütunu dönem listesi) üzerinden Excel 365 formülleri.
+    Sinyal: Raw_data ile aynı kaynaktan (matrix_rows) Python ile hesaplanır; Excel 365 gerekmez.
+    A sütunu Main!A ile senkron; B (Sektör) yfinance değeri olarak yazılır.
     """
+    window_cfg, ucuz_esik, pahali_esik = read_config_signal_params(wb)
+    n_labels = len(period_labels)
+    window_n = min(int(window_cfg), n_labels) if n_labels else 0
+
+    sym_to_cells = {sym: cells for _r, sym, cells in matrix_rows}
+
     name = "Sinyal"
     if name not in wb.sheetnames:
         wb.create_sheet(name)
     ws = wb[name]
 
-    # A–Q (17 sütun); P=Skor, Q=Genel Sinyal
     headers = {
         1: "Ticker",
         2: "Sektör",
@@ -178,157 +249,73 @@ def write_sinyal_sheet(wb, tr_tasks, tr_fin_results_map):
         is_bank = bool(data.get("is_bank", False))
         c_val = "EVET" if is_bank else "HAYIR"
 
-        ws.cell(row=r, column=1, value=f"=Main_TR_Q!A{r}")
-        ws.cell(row=r, column=2, value=f"=Main_TR_Q!B{r}")
+        ws.cell(row=r, column=1, value=f"=Main!A{r}")
+        ws.cell(row=r, column=2, value=data.get("industry", ""))
+
         ws.cell(row=r, column=3, value=c_val)
 
-        cur_p = _facts_current_lookup("PDDD", r)
-        med_p = _facts_median_let("PDDD", r)
-        pct_p = _facts_pct_let("PDDD", r)
-        ws.cell(row=r, column=4, value=f"={cur_p}")
-        ws.cell(row=r, column=5, value=f"={med_p}")
-        ws.cell(row=r, column=6, value=f"={pct_p}")
-        ws.cell(
-            row=r,
-            column=7,
-            value=(
-                f"=IF(F{r}<Config!$B$2/100,\"UCUZ\","
-                f"IF(F{r}>Config!$B$3/100,\"PAHALI\",\"NÖTR\"))"
-            ),
-        )
+        cells = sym_to_cells.get(sym) or []
 
-        cur_f = _facts_current_lookup("FDFAVOK", r)
-        med_f = _facts_median_let("FDFAVOK", r)
-        pct_f = _facts_pct_let("FDFAVOK", r)
-        ws.cell(row=r, column=8, value=f"=IF(C{r}=\"EVET\",\"\",{cur_f})")
-        ws.cell(row=r, column=9, value=f"=IF(C{r}=\"EVET\",\"\",{med_f})")
-        ws.cell(row=r, column=10, value=f"=IF(C{r}=\"EVET\",\"\",{pct_f})")
-        ws.cell(
-            row=r,
-            column=11,
-            value=(
-                f"=IF(C{r}=\"EVET\",\"\","
-                f"IF(J{r}<Config!$B$2/100,\"UCUZ\","
-                f"IF(J{r}>Config!$B$3/100,\"PAHALI\",\"NÖTR\")))"
-            ),
-        )
+        # --- PD/DD (0) ---
+        w_p = _metric_window_floats(cells, 0, window_n)
+        cur_p = _current_metric(cells, 0)
+        med_p = _median_or_none(w_p)
+        pct_p = _excel_style_pct_in_window(w_p, cur_p, window_cfg)
+        sig_p = _signal_ucuz_pahali_neutral(pct_p, ucuz_esik, pahali_esik)
 
-        cur_b = _facts_current_lookup("BORC", r)
-        med_b = _facts_median_let("BORC", r)
-        pct_b = _facts_pct_let("BORC", r)
-        ws.cell(row=r, column=12, value=f"=IF(C{r}=\"EVET\",\"\",{cur_b})")
-        ws.cell(row=r, column=13, value=f"=IF(C{r}=\"EVET\",\"\",{med_b})")
-        ws.cell(row=r, column=14, value=f"=IF(C{r}=\"EVET\",\"\",{pct_b})")
-        ws.cell(
-            row=r,
-            column=15,
-            value=(
-                f"=IF(C{r}=\"EVET\",\"\","
-                f"IF(N{r}<Config!$B$2/100,\"UCUZ\","
-                f"IF(N{r}>Config!$B$3/100,\"PAHALI\",\"NÖTR\")))"
-            ),
-        )
+        ws.cell(row=r, column=4, value=cur_p if cur_p is not None else "")
+        ws.cell(row=r, column=5, value=med_p if med_p is not None else "")
+        ws.cell(row=r, column=6, value=pct_p if pct_p is not None else "")
+        ws.cell(row=r, column=7, value=sig_p)
 
-        ws.cell(
-            row=r,
-            column=16,
-            value=(
-                f"=IF(C{r}=\"EVET\",ROUND((1-F{r})*100,0),"
-                f"ROUND(((1-F{r})*0.4+(1-J{r})*0.4+(1-N{r})*0.2)*100,0))"
-            ),
-        )
-        ws.cell(
-            row=r,
-            column=17,
-            value=(
-                f"=IF(P{r}>Config!$B$3,\"UCUZ\","
-                f"IF(P{r}<Config!$B$2,\"PAHALI\",\"NÖTR\"))"
-            ),
-        )
+        for c in (4, 5, 6):
+            x = ws.cell(row=r, column=c).value
+            if isinstance(x, (int, float)):
+                ws.cell(row=r, column=c).number_format = "0.00"
 
+        # --- FD/FAVÖK (1), Borç (2) — bankada boş ---
+        if is_bank:
+            for c in range(8, 16):
+                ws.cell(row=r, column=c, value="")
+            score = None
+            if pct_p is not None:
+                score = round((1.0 - pct_p) * 100.0)
+        else:
+            w_f = _metric_window_floats(cells, 1, window_n)
+            cur_f = _current_metric(cells, 1)
+            med_f = _median_or_none(w_f)
+            pct_f = _excel_style_pct_in_window(w_f, cur_f, window_cfg)
+            sig_f = _signal_ucuz_pahali_neutral(pct_f, ucuz_esik, pahali_esik)
 
-def write_ozet_sheet(wb, tr_tasks):
-    """
-    Tek ekran özeti: Main_TR_Q, TR_TTM ve Sinyal ile aynı satır numarası (row_idx).
-    """
-    if not tr_tasks:
-        return
-    if "Main_TR_Q" not in wb.sheetnames or "TR_TTM" not in wb.sheetnames:
-        return
-    if "Sinyal" not in wb.sheetnames:
-        return
+            ws.cell(row=r, column=8, value=cur_f if cur_f is not None else "")
+            ws.cell(row=r, column=9, value=med_f if med_f is not None else "")
+            ws.cell(row=r, column=10, value=pct_f if pct_f is not None else "")
+            ws.cell(row=r, column=11, value=sig_f)
 
-    name = OZET_SHEET
-    if name not in wb.sheetnames:
-        wb.create_sheet(name)
-    ws = wb[name]
+            w_b = _metric_window_floats(cells, 2, window_n)
+            cur_b = _current_metric(cells, 2)
+            med_b = _median_or_none(w_b)
+            pct_b = _excel_style_pct_in_window(w_b, cur_b, window_cfg)
+            sig_b = _signal_ucuz_pahali_neutral(pct_b, ucuz_esik, pahali_esik)
 
-    headers = {
-        1: "Ticker",
-        2: "Sektör",
-        3: "Dönem",
-        4: "Banka mı?",
-        5: "Genel Sinyal",
-        6: "Skor",
-        7: "PD/DD Sinyal",
-        8: "FD/FAVÖK Sinyal",
-        9: "Borç/Özser. Sinyal",
-        10: "Faaliyet Kârı (TTM)",
-        11: "Nakit Akışı (TTM)",
-        12: "Net Döviz",
-        13: "İhracat (TTM) %",
-        14: "Yabancı Oranı",
-        15: "Yabancı Oranı Değişim",
-        16: "İşletme özü",
-        17: "Yapı özü",
-    }
-    max_r = 2
-    for r, _ in tr_tasks:
-        max_r = max(max_r, r)
-    _clear_matrix_sheet(ws, max(max_r + 2, 50), 22)
+            ws.cell(row=r, column=12, value=cur_b if cur_b is not None else "")
+            ws.cell(row=r, column=13, value=med_b if med_b is not None else "")
+            ws.cell(row=r, column=14, value=pct_b if pct_b is not None else "")
+            ws.cell(row=r, column=15, value=sig_b)
 
-    for col, text in headers.items():
-        ws.cell(row=1, column=col, value=text)
+            for c in (8, 9, 10, 12, 13, 14):
+                x = ws.cell(row=r, column=c).value
+                if isinstance(x, (int, float)):
+                    ws.cell(row=r, column=c).number_format = "0.00"
 
-    for row_idx, _sym in tr_tasks:
-        r = row_idx
-        ws.cell(row=r, column=1, value=f"=Main_TR_Q!A{r}")
-        ws.cell(row=r, column=2, value=f"=Main_TR_Q!B{r}")
-        ws.cell(row=r, column=3, value=f"=TR_TTM!C{r}")
-        ws.cell(row=r, column=4, value=f"=Sinyal!C{r}")
-        ws.cell(row=r, column=5, value=f"=Sinyal!Q{r}")
-        ws.cell(row=r, column=6, value=f"=Sinyal!P{r}")
-        ws.cell(row=r, column=7, value=f"=Sinyal!G{r}")
-        ws.cell(row=r, column=8, value=f"=Sinyal!K{r}")
-        ws.cell(row=r, column=9, value=f"=Sinyal!O{r}")
-        ws.cell(row=r, column=10, value=f"=TR_TTM!E{r}")
-        ws.cell(row=r, column=11, value=f"=TR_TTM!F{r}")
-        ws.cell(row=r, column=12, value=f"=TR_TTM!G{r}")
-        ws.cell(row=r, column=13, value=f"=TR_TTM!H{r}")
-        ws.cell(row=r, column=14, value=f"=TR_TTM!I{r}")
-        ws.cell(row=r, column=15, value=f"=TR_TTM!J{r}")
-        ws.cell(
-            row=r,
-            column=16,
-            value=(
-                f"=IF(AND(ISNUMBER(TR_TTM!E{r}),TR_TTM!E{r}>0,"
-                f"ISNUMBER(TR_TTM!F{r}),TR_TTM!F{r}>0),\"İşletme+\",\"Dikkat\")"
-            ),
-        )
-        ws.cell(
-            row=r,
-            column=17,
-            value=(
-                f"=IF(Sinyal!C{r}=\"EVET\",\"Banka\","
-                f"IF(AND(ISNUMBER(TR_TTM!D{r}),TR_TTM!D{r}<1,"
-                f"ISNUMBER(TR_TTM!G{r}),TR_TTM!G{r}>0),\"Yapı+\",\"Yapı kontrol\"))"
-            ),
-        )
+            score = None
+            if pct_p is not None and pct_f is not None and pct_b is not None:
+                score = round(
+                    ((1.0 - pct_p) * 0.4 + (1.0 - pct_f) * 0.4 + (1.0 - pct_b) * 0.2) * 100.0
+                )
 
-        for c in (10, 11, 12):
-            cell = ws.cell(row=r, column=c)
-            cell.number_format = "#,##0"
-        ws.cell(row=r, column=13).number_format = "0.00%"
-        ws.cell(row=r, column=14).number_format = "0.00%"
-        ws.cell(row=r, column=15).number_format = "0.00%"
-        ws.cell(row=r, column=6).number_format = "0"
+        ws.cell(row=r, column=16, value=score if score is not None else "")
+        ws.cell(row=r, column=17, value=_genel_signal(score, ucuz_esik, pahali_esik))
+
+        if isinstance(ws.cell(row=r, column=16).value, (int, float)):
+            ws.cell(row=r, column=16).number_format = "0"

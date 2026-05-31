@@ -7,7 +7,6 @@ from requests.adapters import HTTPAdapter
 import pandas as pd
 from pandas.tseries.offsets import BDay
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 import concurrent.futures
 import datetime
 import yfinance as yf
@@ -358,22 +357,26 @@ def task_tr_stock(row_idx, symbol):
 def task_yabanci_oran(row_idx, symbol, date_a, date_b):
     return {'row_idx': row_idx, 'symbol': symbol, 'data': fetch_yabanci_oran(symbol, date_a, date_b)}
 
-def task_historical_q(row_idx, symbol, quarter_list):
-    """Her çeyrek için PD/DD, FD/FAVÖK (banka hariç), Borç/Özsermaye (banka hariç); quarter_list (y,q) en güncelden eskiye."""
+def task_historical_q(row_idx, symbol, quarter_list, live_price=None):
+    """Her çeyrek için PD/DD, FD/FAVÖK (banka hariç), Borç/Özsermaye (banka hariç); quarter_list (y,q) en güncelden eskiye.
+
+    FD/FAVÖK paydası çeyreklik FAVÖK×4 iken piyasa değeri için Yabancı Oranı sayfasındaki güncel fiyat
+    kullanılır (live_price); yoksa o çeyreğin tarihsel fiyatına düşülür. PD/DD tarihsel fiyatla kalır.
+    """
     cells = []
     for (y, q) in quarter_list:
         pddd = None
         fd_favok = None
-        borc = None
+        borc_ozk = None
 
         df_hist, resolved_h, partial_h, group_h = fetch_tr_raw_data(symbol, period_val=(y, q))
         if df_hist is None:
-            cells.append((pddd, fd_favok, borc))
+            cells.append((pddd, fd_favok, borc_ozk))
             continue
 
         res = parse_tr_data(df_hist, resolved_h, partial_h, group_h)
         if not res:
-            cells.append((pddd, fd_favok, borc))
+            cells.append((pddd, fd_favok, borc_ozk))
             continue
 
         is_bank = res.get("is_bank", False)
@@ -389,124 +392,175 @@ def task_historical_q(row_idx, symbol, quarter_list):
         if not is_bank:
             net_borc = res.get("net_borc")
             favok_q = res.get("favok_q")
+            px_fd = (
+                live_price
+                if isinstance(live_price, (int, float)) and not isinstance(live_price, bool)
+                else hist_price
+            )
             if (
-                isinstance(hist_price, (int, float))
+                isinstance(px_fd, (int, float))
                 and isinstance(item_2oa, (int, float))
                 and isinstance(net_borc, (int, float))
                 and isinstance(favok_q, (int, float))
                 and favok_q != 0
             ):
-                piyasa_degeri = hist_price * item_2oa
-                fd = piyasa_degeri + net_borc
+                piyasa_fd = px_fd * item_2oa
+                fd = piyasa_fd + net_borc
                 fd_favok = fd / (favok_q * 4)
 
             de = res.get("debt_equity")
             if isinstance(de, (int, float)):
-                borc = de
+                borc_ozk = de
 
-        cells.append((pddd, fd_favok, borc))
+        cells.append((pddd, fd_favok, borc_ozk))
 
     return {"row_idx": row_idx, "symbol": symbol, "cells": cells}
-
-
-# Şablondan her çalıştırmada kaldırılan sayfalar (bisttum ve çalışma sayfaları korunur).
-_WORKBOOK_SHEETS_TO_REMOVE = frozenset(
-    {
-        "Historical_Q",
-        "Historical_TTM",
-        "analyze_input",
-        "Sheet1",
-    }
-)
-
-
-def _prune_unused_workbook_sheets(wb):
-    for name in list(wb.sheetnames):
-        if name in _WORKBOOK_SHEETS_TO_REMOVE:
-            wb.remove(wb[name])
-
-
-def _move_sheet_to_first(wb, sheet_name):
-    if sheet_name not in wb.sheetnames:
-        return
-    idx = wb.sheetnames.index(sheet_name)
-    if idx == 0:
-        return
-    ws = wb[sheet_name]
-    move = getattr(wb, "move_sheet", None)
-    if callable(move):
-        try:
-            move(ws, offset=-idx)
-            return
-        except Exception:
-            pass
-    wb._sheets.insert(0, wb._sheets.pop(idx))
 
 
 # ==============================================================================
 # 6. ORKESTRASYON VE EXCEL ANA MOTORU (BELLEK ODAKLI)
 # ==============================================================================
 
-def main_automation(num_quarters=12):
+
+def _base_period_from_resolved(resolved):
+    if not resolved or resolved == "Bulunamadı":
+        return ""
+    s = str(resolved).strip()
+    if " (" in s:
+        s = s.split(" (", 1)[0].strip()
+    return s
+
+
+def collect_snapshot_raw_rows(sym, d, yab_end, yab_change, piyasa_degeri):
+    """Güncel özet metriklerini Raw_data uzun satırlarına dönüştürür: (ticker, metrik, dönem, değer, nf).
+
+    PD/DD (`PDDD`) buraya yazılmaz: çeyreklik geçmişte en güncel çeyrek zaten aynı dönem
+    etiketiyle dolduruluyor; anlık fiyatla tekrar yazmak çift satır ve çelişen değer üretirdi.
+
+    `BORC_OZK` ve çeyreklik `FD_FAVOK` yalnızca çeyreklik geçmiş blokta. Snapshot’ta
+    `FD_FAVOK` için yalnızca TTM satırı (`favok_ttm` paydası) eklenir.
+    """
+    rows = []
+    base = _base_period_from_resolved(d.get("resolved_period"))
+    period_q = base if base else ""
+    period_ttm = f"{base} (TTM)" if base else "(TTM)"
+
+    net_borc = d.get("net_borc", "")
+    favok_ttm = d.get("favok_ttm", "")
+    favok_q = d.get("favok_q", "")
+
+    fd_ttm = ""
+    if isinstance(piyasa_degeri, (int, float)) and isinstance(net_borc, (int, float)):
+        fd = piyasa_degeri + net_borc
+        if isinstance(favok_ttm, (int, float)) and favok_ttm != 0:
+            fd_ttm = fd / favok_ttm
+
+    def snap(code, v_q, v_t, nf):
+        rows.append((sym, code, period_q, v_q, nf))
+        rows.append((sym, code, period_ttm, v_t, nf))
+
+    def snap_same(code, val, nf):
+        rows.append((sym, code, period_q, val, nf))
+        rows.append((sym, code, period_ttm, val, nf))
+
+    snap("OP_INC", d.get("op_income_q", ""), d.get("op_income_ttm", ""), "#,##0")
+
+    snap("NCF", d.get("op_cash_flow_q", ""), d.get("op_cash_flow_ttm", ""), "#,##0")
+
+    nfx = d.get("net_fx", "")
+    nf_nfx = "#,##0" if isinstance(nfx, (int, float)) else None
+    snap_same("NET_FX", nfx, nf_nfx)
+
+    snap(
+        "EXP_RATIO",
+        d.get("export_ratio_q", ""),
+        d.get("export_ratio_ttm", ""),
+        "0.00%",
+    )
+
+    nf_y = "0.00%" if isinstance(yab_end, (int, float)) else None
+    snap_same("YAB_END", yab_end, nf_y)
+    nf_yc = "0.00%" if isinstance(yab_change, (int, float)) else None
+    snap_same("YAB_CHG", yab_change, nf_yc)
+
+    nf_pd = "#,##0" if isinstance(piyasa_degeri, (int, float)) else None
+    snap_same("PD", piyasa_degeri, nf_pd)
+
+    snap("FAVOK", favok_q, favok_ttm, "#,##0")
+
+    # Çeyreklik FD/FAVÖK çeyreklik geçmişte (FD_FAVOK); burada yalnızca TTM paydası (favok_ttm) ile tek satır.
+    nf_fd = "0.00"
+    if isinstance(fd_ttm, (int, float)) and not isinstance(fd_ttm, bool):
+        rows.append((sym, "FD_FAVOK", period_ttm, fd_ttm, nf_fd))
+
+    return rows
+
+def main_automation():
     file_name = "analysis.xlsx"
-    sheet_tr_name, sheet_yab_name = "Main_TR", "Yabancı Oranı"
-    if not os.path.exists(file_name): print(f"Hata: '{file_name}' dosyası bulunamadı!"); return
+    sheet_yab_name = "Yabancı Oranı"
+    if not os.path.exists(file_name):
+        print(f"Hata: '{file_name}' dosyası bulunamadı!")
+        return
     wb = load_workbook(file_name)
 
-    # İşlemlere başlamadan önce tüm hücrelerin arka plan rengini (highlight) temizle
-    clear_fill = PatternFill(fill_type=None)
-    for sheet_name in wb.sheetnames:
-        for row in wb[sheet_name].iter_rows():
-            for cell in row:
-                cell.fill = clear_fill
+    excel_sheets.remove_facts_sheet_if_present(wb)
+    excel_sheets.clear_managed_output_sheets_body(wb)
 
+    # Çekilecek çeyrek sayısı yalnızca Config!B1 (analiz_donemi) ile belirlenir.
+    window_cfg, _, _ = excel_sheets.read_config_signal_params(wb)
+    num_quarters = max(1, int(window_cfg))
+
+    main_sheet = "Main"
+    if main_sheet not in wb.sheetnames:
+        print(f"Hata: '{main_sheet}' sayfası bulunamadı! Tickler yalnızca bu sayfada okunur.")
+        return
+
+    ws_main = wb[main_sheet]
     tr_tasks = []
-    date_a, date_b = "01-01-2024", "01-01-2024" # Varsayılan (eğer sayfa yoksa)
+    for row in range(2, ws_main.max_row + 1):
+        symbol = str(ws_main.cell(row=row, column=1).value or "").strip()
+        if symbol:
+            tr_tasks.append((row, symbol))
 
-    # TR Hisse Listesi
-    sheet_tr_name = "Main_TR_Q" if "Main_TR_Q" in wb.sheetnames else "Main_TR"
-    if sheet_tr_name in wb.sheetnames:
-        ws_tr = wb[sheet_tr_name]
-        for row in range(2, ws_tr.max_row + 1):
-            symbol = str(ws_tr.cell(row=row, column=1).value or "").strip()
-            if symbol: tr_tasks.append((row, symbol))
-        
-        if sheet_yab_name not in wb.sheetnames: wb.create_sheet(sheet_yab_name)
-        ws_yab = wb[sheet_yab_name]
-        if tr_tasks:
-            test_symbol = tr_tasks[0][1]
-            print(f"Yabancı oranı için geçerli iş günleri aranıyor (Referans: {test_symbol})...")
-            date_a, date_b = get_yabanci_oran_dates(test_symbol)
-        else:
-            date_a, date_b = "01-01-2024", "01-01-2024"
+    date_a, date_b = "01-01-2024", "01-01-2024"
+    if sheet_yab_name not in wb.sheetnames:
+        wb.create_sheet(sheet_yab_name)
+    if tr_tasks:
+        test_symbol = tr_tasks[0][1]
+        print(f"Yabancı oranı için geçerli iş günleri aranıyor (Referans: {test_symbol})...")
+        date_a, date_b = get_yabanci_oran_dates(test_symbol)
+    else:
+        date_a, date_b = "01-01-2024", "01-01-2024"
 
     quarter_list = resolve_quarter_list_for_workbook(tr_tasks, num_quarters) if tr_tasks else []
     period_labels = [period_label(y, q) for y, q in quarter_list]
     matrix_tasks = [(r, sym, quarter_list) for r, sym in tr_tasks]
 
-    print(f"\n🚀 Belleğe Alınıyor... TR: {len(tr_tasks)} şirket (matris: {num_quarters} çeyrek)")
+    print(
+        f"\n🚀 Belleğe Alınıyor... TR: {len(tr_tasks)} şirket "
+        f"(matris: {num_quarters} çeyrek, Config analiz_donemi B1)"
+    )
 
     # ==============================================================
-    # 2 AYRI MOTOR — HER API KENDİ THREAD HAVUZUNU KULLANIR
+    # Önce TR + Yabancı (güncel fiyat), sonra çeyreklik geçmiş (FD/FAVÖK için canlı fiyat)
     # ==============================================================
-    
+
     _t_start = time.perf_counter()
 
-    executor_tr  = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="TR-Mali")
+    tr_fin_results_map, tr_yab_results_map, hist_q_results_map = {}, {}, {}
+    sym_live_price = {}
+
+    executor_tr = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="TR-Mali")
     executor_yab = concurrent.futures.ThreadPoolExecutor(max_workers=50, thread_name_prefix="Yabanci")
-    executor_hist = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="Hist-Q")
 
-    # Her motor kendi görevlerini alır
-    futures_tr  = {executor_tr.submit(task_tr_stock, r, sym): ('TR', sym) for r, sym in tr_tasks}
-    futures_yab = {executor_yab.submit(task_yabanci_oran, r, sym, date_a, date_b): ('YAB', sym) for r, sym in tr_tasks}
-    futures_hist = {executor_hist.submit(task_historical_q, r, sym, ql): ('HIST_Q', sym) for r, sym, ql in matrix_tasks}
+    futures_tr = {executor_tr.submit(task_tr_stock, r, sym): ("TR", sym) for r, sym in tr_tasks}
+    futures_yab = {executor_yab.submit(task_yabanci_oran, r, sym, date_a, date_b): ("YAB", sym) for r, sym in tr_tasks}
+    phase1 = {}
+    phase1.update(futures_tr)
+    phase1.update(futures_yab)
 
-    all_futures = {}
-    all_futures.update(futures_tr)
-    all_futures.update(futures_yab)
-    all_futures.update(futures_hist)
-
-    total_tr, total_yab, total_hist = len(futures_tr), len(futures_yab), len(futures_hist)
+    total_tr, total_yab = len(futures_tr), len(futures_yab)
+    total_hist = len(matrix_tasks)
     done_tr, done_yab, done_hist = 0, 0, 0
     total_all = total_tr + total_yab + total_hist
     done_all = 0
@@ -532,28 +586,43 @@ def main_automation(num_quarters=12):
 
     _print_progress()
 
-    tr_fin_results_map, tr_yab_results_map, hist_q_results_map = {}, {}, {}
-
-    for future in concurrent.futures.as_completed(all_futures):
-        task_type, sym = all_futures[future]
+    for future in concurrent.futures.as_completed(phase1):
+        task_type, sym = phase1[future]
         result = future.result()
         last_sym = sym
 
-        if task_type == 'TR':
+        if task_type == "TR":
             tr_fin_results_map[sym] = result
             done_tr += 1
-        elif task_type == 'YAB':
+        else:
             tr_yab_results_map[sym] = result
+            p = (result.get("data") or {}).get("price")
+            if isinstance(p, (int, float)) and not isinstance(p, bool):
+                sym_live_price[sym] = float(p)
             done_yab += 1
-        elif task_type == 'HIST_Q':
-            hist_q_results_map[sym] = result
-            done_hist += 1
 
         done_all += 1
         _print_progress()
 
     executor_tr.shutdown(wait=False)
     executor_yab.shutdown(wait=False)
+
+    executor_hist = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="Hist-Q")
+    futures_hist = {
+        executor_hist.submit(
+            task_historical_q, r, sym, ql, sym_live_price.get(sym)
+        ): ("HIST_Q", sym)
+        for r, sym, ql in matrix_tasks
+    }
+
+    for future in concurrent.futures.as_completed(futures_hist):
+        task_type, sym = futures_hist[future]
+        hist_q_results_map[sym] = future.result()
+        last_sym = sym
+        done_hist += 1
+        done_all += 1
+        _print_progress()
+
     executor_hist.shutdown(wait=False)
 
     tr_fin_results = [tr_fin_results_map[sym] for _, sym in tr_tasks]
@@ -562,114 +631,23 @@ def main_automation(num_quarters=12):
     elapsed_total = time.perf_counter() - _t_start
     print(f"\n\n✅ Tüm veriler RAM'e çekildi ({elapsed_total:.1f}s). Excel'e formatlanarak yazılıyor...\n")
 
-    # ==============================================================
-    # FORMATLAYARAK EXCEL'E TEK SEFERDE YAZ (WRITE-LOCK)
-    # ==============================================================
-    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    no_fill = PatternFill(fill_type=None)
-    
-    yab_dict = {res['symbol']: res['data'] for res in tr_yab_results}
+    yab_dict = {res["symbol"]: res["data"] for res in tr_yab_results}
 
-    sheet_tr_ttm_name = "TR_TTM"
-    sheet_tr_q_name = "Main_TR_Q"
-
-    if sheet_tr_ttm_name not in wb.sheetnames: wb.create_sheet(sheet_tr_ttm_name)
-    if sheet_tr_q_name not in wb.sheetnames: wb.create_sheet(sheet_tr_q_name)
-
-    ws_ttm = wb[sheet_tr_ttm_name]
-    ws_q = wb[sheet_tr_q_name]
-
-    headers_ttm = {
-        1: "Ticker", 2: "Sektör", 3: "Dönem", 4: "Borç / Özsermaye", 5: "Faaliyet Kârı (TTM)", 
-        6: "Nakit Akışı (TTM)", 7: "Net Döviz Pozisyonu", 8: "İhracat Geliri (TTM)", 
-        9: "Yabancı Oranı", 10: "Yabancı Oranı Değişim",
-        11: "Piyasa Değeri", 12: "PD/DD",
-        13: "FAVÖK (TTM)", 14: "FD / FAVÖK (TTM)"
-    }
-    headers_q = {
-        1: "Ticker", 2: "Sektör", 3: "Dönem", 4: "Borç / Özsermaye", 5: "Faaliyet Kârı (Q)", 
-        6: "Nakit Akışı (Q)", 7: "Net Döviz Pozisyonu", 8: "İhracat Geliri (Q)", 
-        9: "Yabancı Oranı", 10: "Yabancı Oranı Değişim",
-        11: "Piyasa Değeri", 12: "PD/DD",
-        13: "FAVÖK (Q)", 14: "FD / FAVÖK (Yıllıklandırılmış Q)"
-    }
-
-    for col_num, text in headers_ttm.items(): ws_ttm.cell(row=1, column=col_num, value=text)
-    for col_num, text in headers_q.items(): ws_q.cell(row=1, column=col_num, value=text)
-
+    snapshot_rows_all = []
     for res in tr_fin_results:
-        r, sym, d = res['row_idx'], res['symbol'], res['data']
-        is_b = d.get('is_bank', False)
-        
-        yab_end = yab_dict[sym]['end'] if sym in yab_dict else ""
-        yab_change = yab_dict[sym]['change'] if sym in yab_dict else ""
-        price = yab_dict[sym]['price'] if sym in yab_dict else ""
-        item_2oa = d.get('item_2oa', "")
-        ozk = d.get('ozk', "")
-        net_borc = d.get('net_borc', "")
-        
+        sym, d = res["symbol"], res["data"]
+        yab_end = yab_dict[sym]["end"] if sym in yab_dict else ""
+        yab_change = yab_dict[sym]["change"] if sym in yab_dict else ""
+        price = yab_dict[sym]["price"] if sym in yab_dict else ""
+        item_2oa = d.get("item_2oa", "")
+
         piyasa_degeri = ""
-        pddd = ""
         if isinstance(price, (int, float)) and isinstance(item_2oa, (int, float)):
             piyasa_degeri = price * item_2oa
-            if isinstance(ozk, (int, float)) and ozk != 0:
-                pddd = piyasa_degeri / ozk
 
-        def write_row(ws, suffix, is_q=False):
-            ws.cell(row=r, column=1, value=sym)
-            ws.cell(row=r, column=2, value=d.get('industry', ''))
-            ws.cell(row=r, column=3, value=d['resolved_period'])
-            
-            c4 = ws.cell(row=r, column=4, value=d['debt_equity'])
-            if isinstance(c4.value, (int, float)): c4.number_format = '0.00'
-            
-            c5 = ws.cell(row=r, column=5, value=d.get(f'op_income_{suffix}', ''))
-            if isinstance(c5.value, (int, float)): c5.number_format = '#,##0'
-            
-            c6 = ws.cell(row=r, column=6, value=d.get(f'op_cash_flow_{suffix}', ''))
-            if isinstance(c6.value, (int, float)): c6.number_format = '#,##0'
-            
-            c7 = ws.cell(row=r, column=7, value=d.get('net_fx', ''))
-            if isinstance(c7.value, (int, float)): c7.number_format = '#,##0'
-            
-            c8 = ws.cell(row=r, column=8, value=d.get(f'export_ratio_{suffix}', ''))
-            if isinstance(c8.value, (int, float)): c8.number_format = '0.00%'
-            
-            c9 = ws.cell(row=r, column=9, value=yab_end)
-            if isinstance(c9.value, (int, float)): c9.number_format = '0.00%'
-            
-            c10 = ws.cell(row=r, column=10, value=yab_change)
-            if isinstance(c10.value, (int, float)): c10.number_format = '0.00%'
-
-            c11 = ws.cell(row=r, column=11, value=piyasa_degeri)
-            if isinstance(c11.value, (int, float)): c11.number_format = '#,##0'
-
-            c12 = ws.cell(row=r, column=12, value=pddd)
-            if isinstance(c12.value, (int, float)): c12.number_format = '0.00'
-
-            favok = d.get(f'favok_{suffix}', "")
-            c13 = ws.cell(row=r, column=13, value=favok)
-            if isinstance(c13.value, (int, float)): c13.number_format = '#,##0'
-
-            fd_favok = ""
-            if isinstance(piyasa_degeri, (int, float)) and isinstance(net_borc, (int, float)):
-                fd = piyasa_degeri + net_borc
-                if isinstance(favok, (int, float)) and favok != 0:
-                    if is_q:
-                        fd_favok = fd / (favok * 4)
-                    else:
-                        fd_favok = fd / favok
-            
-            c14 = ws.cell(row=r, column=14, value=fd_favok)
-            if isinstance(c14.value, (int, float)): c14.number_format = '0.00'
-
-            c4.fill = green_fill if not is_b and isinstance(c4.value, (int, float)) and c4.value < 1.0 else no_fill
-            c5.fill = green_fill if isinstance(c5.value, (int, float)) and c5.value > 0 else no_fill
-            c6.fill = green_fill if isinstance(c6.value, (int, float)) and c6.value > 0 else no_fill
-            c7.fill = green_fill if not is_b and isinstance(c7.value, (int, float)) and c7.value > 0 else no_fill
-
-        write_row(ws_ttm, 'ttm', is_q=False)
-        write_row(ws_q, 'q', is_q=True)
+        snapshot_rows_all.extend(
+            collect_snapshot_raw_rows(sym, d, yab_end, yab_change, piyasa_degeri)
+        )
 
     # Yabancı Oranı Sayfasını Yazma
     if sheet_yab_name in wb.sheetnames:
@@ -702,31 +680,14 @@ def main_automation(num_quarters=12):
         matrix_rows.append((r, sym, cells))
 
     excel_sheets.ensure_config_sheet(wb)
-    excel_sheets.update_config_period_labels(wb, period_labels)
-    excel_sheets.write_facts(wb, period_labels, matrix_rows)
-    excel_sheets.write_sinyal_sheet(wb, tr_tasks, tr_fin_results_map)
-    excel_sheets.write_ozet_sheet(wb, tr_tasks)
-    _prune_unused_workbook_sheets(wb)
-    _move_sheet_to_first(wb, excel_sheets.OZET_SHEET)
+    excel_sheets.write_raw_data(wb, period_labels, matrix_rows, snapshot_rows_all)
+    excel_sheets.write_sinyal_sheet(
+        wb, tr_tasks, tr_fin_results_map, matrix_rows, period_labels
+    )
 
     wb.save(file_name)
     print(f"✅ Excel dosyası başarıyla güncellendi ve kapatıldı!")
 
 
-def _parse_num_quarters():
-    default = 12
-    if len(sys.argv) <= 1:
-        return default
-    try:
-        v = int(sys.argv[1])
-        if v < 1:
-            print(f"Uyarı: geçersiz dönem {sys.argv[1]!r}, varsayılan {default} kullanılıyor.")
-            return default
-        return v
-    except ValueError:
-        print(f"Uyarı: {sys.argv[1]!r} tamsayı değil, varsayılan {default} kullanılıyor.")
-        return default
-
-
 if __name__ == "__main__":
-    main_automation(num_quarters=_parse_num_quarters())
+    main_automation()
