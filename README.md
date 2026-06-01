@@ -18,7 +18,8 @@
 | `PDDD` | PD/DD — piyasa değeri ÷ özkaynaklar (özsermaye defter değeri). Yalnızca **çeyreklik geçmiş** blokta (özet snapshot’ta tekrar yazılmaz; aynı dönem için çift satır/çelişen değer oluşmasın diye). |
 | `FD_FAVOK` | FD/FAVÖK — (güncel fiyat × `item_2oa` + net borç) ÷ FAVÖK. **Çeyreklik geçmiş:** her çeyrek için o çeyreğin bilanço kırılımları + aynı güncel fiyat (Yabancı Oranı); payda çeyrek FAVÖK × 4. **Snapshot:** yalnızca `… (TTM)` satırı — payda `favok_ttm`. Bankalarda çeyreklik blokta değer yoktur. |
 | `BORC_OZK` | Borç / özsermaye (`debt_equity`); yalnızca **çeyreklik geçmiş**te her dönem ayrı satır. (Eski `BORC` / çift `BORC_OZK` snapshot kaldırıldı.) |
-| `OP_INC` | Faaliyet kârı — çeyrek (`Q`) ve yuvarlanmış dört çeyrek (`TTM`) için ayrı satırlar. |
+| `EBIT` | Faaliyet kârı (Faiz ve Vergi Öncesi Kâr) — çeyrek (`Q`) ve yuvarlanmış dört çeyrek (`TTM`) için ayrı satırlar. |
+| `NET_OP_INC` | Net Faaliyet Kârı (Net Operating Income - EBIT + İştirak ve Yatırım Gelir/Giderleri) — çeyrek (`Q`) ve yuvarlanmış dört çeyrek (`TTM`) için ayrı satırlar. |
 | `NCF` | İşletme faaliyetlerinden nakit akışı (`op_cash_flow`) — Q ve TTM. |
 | `NET_FX` | Net yabancı para (döviz) pozisyonu; Q/TTM satırlarında aynı bilanço kırılımı. |
 | `EXP_RATIO` | İhracatın satışlara oranı (yurtdışı satışlar ÷ satış gelirleri); yüzde olarak. |
@@ -62,3 +63,27 @@ python isyat.py
 Çekilecek çeyrek sayısı komut satırından verilmez; **Config `analiz_donemi` (B1)** değerine göre belirlenir (yeni kitapta varsayılan 12). B1’i değiştirip kaydettikten sonra betiği çalıştırın.
 
 Her koşuda betik, **Main** dışında `Raw_data`, `Yabancı Oranı` ve `Sinyal` sayfalarında başlık hariç eski veri ve hücre dolgularını temizleyip yeniden yazar.
+
+
+İşte kodlarken veya analiz yaparken her iki metriği neden yan yana kullanman gerektiğini hatırlatacak en özet rehber:
+
+**1. `3DF` (Esas Faaliyet Kârı / EBIT)**
+
+* **Ne Ölçer?** Sadece şirketin **ana dükkanının/fabrikasının** kârını (Saf operasyon gücü).
+* **Hangi Şirketlerde Önemli?** Üretim ve perakende (Örn: Ford, BİM).
+
+**2. `3H` (Net Faaliyet Kârı / Net Operating Income)**
+
+* **Ne Ölçer?** Ana iş + **İştirak (alt şirket) ve yatırım** kârları.
+* **Hangi Şirketlerde Önemli?** Alt şirketlerinden kâr sağlayan holdingler (Örn: Koç Holding, Sabancı Holding).
+
+---
+
+### 💡 Altın Kural: Neden İkisi de Lazım?
+
+İki metriği yan yana koyarak şu iki büyük hatadan kurtulursun:
+
+1. **Holdingleri Yanlış Okumamak:** Holdinglerin ana geliri iştirakleridir. Sadece `3DF` (ana dükkan) bakarsan dev holdingleri zayıf sanırsın. Onları `3H` ile tartmalısın.
+2. **Makyajlı Bilançolara Kanmamak:** Bir tekstil şirketinin kendi işi zarar ediyordur (`3DF` negatiftir), ama tek seferlik bir arsa satmıştır (`3H` pozitife fırlar). İkisine birden bakmazsan, o şirketi "kârlı" sanıp tuzağa düşersin.
+
+**Özetin Özeti:** Ana işin ne kadar sağlıklı olduğunu görmek için **`3DF`**'ye, şirketin tüm iştirak yapısıyla cebine koyduğu operasyonel kârı görmek için **`3H`**'ye bak!

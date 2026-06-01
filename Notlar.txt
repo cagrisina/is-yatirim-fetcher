@@ -1,11 +1,4 @@
 
-18.05.2026 00:03
-En sonki problem API verisi çekerken son 4 çeyreği çekip çekmediğine emin olamadım. (bu sorun çözüldü) FAVÖK yıllaklandırılmış bakılıyor ttm değil ise yani firma değeri / 4* favök
-
-bir sonraki plan, tarihsel bir sheet aç ve seçili hisselerin tarihsel olarak oranlarına bakalım
-
-
-
 Aşağıdaki rasyolar eklenecek:
 https://gemini.google.com/u/1/app/2409169691496c83?hl=tr
 

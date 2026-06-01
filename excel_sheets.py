@@ -8,11 +8,12 @@ _NO_FILL = PatternFill(fill_type=None)
 
 RAW_DATA_SHEET = "Raw_data"
 
-# (Raw_data "Metrik" kodu, hist hücre üçlüsündeki indeks: pddd, fd_favok, borc_ozk)
+# (Raw_data "Metrik" kodu, hist hücredeki indeks: pddd, fd_favok, borc_ozk, ihracat_orani)
 METRICS = [
     ("PDDD", 0),
     ("FD_FAVOK", 1),
     ("BORC_OZK", 2),
+    ("IHRACAT_ORANI", 3),
 ]
 
 MANAGED_OUTPUT_SHEETS = ("Raw_data", "Yabancı Oranı", "Sinyal")
@@ -71,22 +72,13 @@ def clear_managed_output_sheets_body(wb, max_row=5000, max_col=30):
         if name not in wb.sheetnames:
             continue
         ws = wb[name]
-        end_r = max(ws.max_row or 2, max_row)
-        for r in range(2, end_r + 1):
-            for c in range(1, max_col + 1):
-                cell = ws.cell(row=r, column=c)
-                cell.value = None
-                cell.fill = _NO_FILL
-                cell.number_format = "General"
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row)
 
 
-def _clear_matrix_sheet(ws, max_row, max_col):
-    for r in range(1, max_row + 1):
-        for c in range(1, max_col + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.value = None
-            cell.fill = _NO_FILL
-            cell.number_format = "General"
+def _clear_matrix_sheet(ws, max_row=None, max_col=None):
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row)
 
 
 def write_raw_data(wb, period_labels, matrix_rows, snapshot_rows):
@@ -120,15 +112,26 @@ def write_raw_data(wb, period_labels, matrix_rows, snapshot_rows):
         )
         for j in range(n):
             period = period_labels[j] if j < len(period_labels) else ""
-            trip = cells[j] if j < len(cells) else (None, None, None)
+            trip = cells[j] if j < len(cells) else (None, None, None, None)
             for metric_code, idx in METRICS:
                 v = trip[idx] if idx < len(trip) else None
+                if metric_code == "IHRACAT_ORANI":
+                    if period.endswith("/12"):
+                        display_period = period.split("/")[0]
+                    else:
+                        continue
+                else:
+                    display_period = period
+
                 ws.cell(row=out_r, column=1, value=symbol)
                 ws.cell(row=out_r, column=2, value=metric_code)
-                ws.cell(row=out_r, column=3, value=period)
+                ws.cell(row=out_r, column=3, value=display_period)
                 c = ws.cell(row=out_r, column=4, value=v)
                 if isinstance(v, (int, float)):
-                    c.number_format = "0.00"
+                    if metric_code == "IHRACAT_ORANI":
+                        c.number_format = "0.00%"
+                    else:
+                        c.number_format = "0.00"
                 out_r += 1
 
     for ticker, metrik, donem, deger, nf in snapshot_rows:
@@ -249,7 +252,7 @@ def write_sinyal_sheet(wb, tr_tasks, tr_fin_results_map, matrix_rows, period_lab
         is_bank = bool(data.get("is_bank", False))
         c_val = "EVET" if is_bank else "HAYIR"
 
-        ws.cell(row=r, column=1, value=f"=Main!A{r}")
+        ws.cell(row=r, column=1, value=sym)
         ws.cell(row=r, column=2, value=data.get("industry", ""))
 
         ws.cell(row=r, column=3, value=c_val)

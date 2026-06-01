@@ -183,6 +183,22 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
         else: q = v1 - v4
         return ttm, q
 
+    def get_val_by_code(code_str):
+        v1, v2, v3, v4 = 0.0, 0.0, 0.0, 0.0
+        if 'itemCode' not in df.columns: return v1, v2, v3, v4
+        mask = df['itemCode'].fillna('').astype(str).str.strip().str.upper() == code_str
+        if not df[mask].empty:
+            row = df[mask].iloc[0]
+            try: v1 = float(row.get('value1') or 0)
+            except: pass
+            try: v2 = float(row.get('value2') or 0)
+            except: pass
+            try: v3 = float(row.get('value3') or 0)
+            except: pass
+            try: v4 = float(row.get('value4') or 0)
+            except: pass
+        return v1, v2, v3, v4
+
     item_2oa_v1 = 0.0
     if 'itemCode' in df.columns:
         mask_2oa = df['itemCode'].fillna('').str.upper() == '2OA'
@@ -194,12 +210,19 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
     if ozk_v1 == 0: ozk_v1, _, _, _ = extract_tr_value(df, "Özkaynaklar")
 
     if is_bank:
-        op_inc_v1, op_inc_v2, op_inc_v3, op_inc_v4 = extract_tr_value(df, "NET FAALİYET KARI/ZARARI")
-        op_inc_ttm, op_inc_q = calc_ttm_and_q(op_inc_v1, op_inc_v2, op_inc_v3, op_inc_v4)
+        net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4 = get_val_by_code("3H")
+        if net_op_inc_v1 == 0 and net_op_inc_v2 == 0 and net_op_inc_v3 == 0:
+            net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4 = extract_tr_value(df, "NET FAALİYET KARI/ZARARI")
+        net_op_inc_ttm, net_op_inc_q = calc_ttm_and_q(net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4)
+
+        ebit_v1, ebit_v2, ebit_v3, ebit_v4 = extract_tr_value(df, "NET FAALİYET KARI/ZARARI")
+        ebit_ttm, ebit_q = calc_ttm_and_q(ebit_v1, ebit_v2, ebit_v3, ebit_v4)
         return {
             "debt_equity": "", 
-            "op_income_ttm": op_inc_ttm,
-            "op_income_q": op_inc_q,
+            "ebit_ttm": ebit_ttm,
+            "ebit_q": ebit_q,
+            "net_op_income_ttm": net_op_inc_ttm,
+            "net_op_income_q": net_op_inc_q,
             "op_cash_flow_ttm": "", 
             "op_cash_flow_q": "", 
             "net_fx": "", 
@@ -213,22 +236,6 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
             "resolved_period": resolved_period_name, "is_bank": True
         }
     else:
-        def get_val_by_code(code_str):
-            v1, v2, v3, v4 = 0.0, 0.0, 0.0, 0.0
-            if 'itemCode' not in df.columns: return v1, v2, v3, v4
-            mask = df['itemCode'].fillna('').astype(str).str.strip().str.upper() == code_str
-            if not df[mask].empty:
-                row = df[mask].iloc[0]
-                try: v1 = float(row.get('value1') or 0)
-                except: pass
-                try: v2 = float(row.get('value2') or 0)
-                except: pass
-                try: v3 = float(row.get('value3') or 0)
-                except: pass
-                try: v4 = float(row.get('value4') or 0)
-                except: pass
-            return v1, v2, v3, v4
-
         kv_borc_v1, _, _, _ = get_val_by_code("2AA")
         uv_borc_v1, _, _, _ = get_val_by_code("2BA")
         borc_v1 = kv_borc_v1 + uv_borc_v1
@@ -239,28 +246,37 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
         
         net_borc = borc_v1 - (nakit_v1 + fin_yat_kisa_v1 + fin_yat_uzun_v1)
         
-        op_inc_v1, op_inc_v2, op_inc_v3, op_inc_v4 = get_val_by_code("3DF")
-        if op_inc_v1 == 0 and op_inc_v2 == 0 and op_inc_v3 == 0:
-            op_inc_v1, op_inc_v2, op_inc_v3, op_inc_v4 = extract_tr_value(df, r"^\s*FAALİYET KARI\s*(?:\(ZARARI\))?$", regex=True)
-        op_inc_ttm, op_inc_q = calc_ttm_and_q(op_inc_v1, op_inc_v2, op_inc_v3, op_inc_v4)
+        ebit_v1, ebit_v2, ebit_v3, ebit_v4 = get_val_by_code("3DF")
+        if ebit_v1 == 0 and ebit_v2 == 0 and ebit_v3 == 0:
+            ebit_v1, ebit_v2, ebit_v3, ebit_v4 = extract_tr_value(df, r"^\s*FAALİYET KARI\s*(?:\(ZARARI\))?$", regex=True)
+        ebit_ttm, ebit_q = calc_ttm_and_q(ebit_v1, ebit_v2, ebit_v3, ebit_v4)
         
+        net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4 = get_val_by_code("3H")
+        if net_op_inc_v1 == 0 and net_op_inc_v2 == 0 and net_op_inc_v3 == 0:
+            net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4 = extract_tr_value(df, r"^\s*NET FAALİYET KARI\s*(?:\(ZARARI\))?$", regex=True)
+        net_op_inc_ttm, net_op_inc_q = calc_ttm_and_q(net_op_inc_v1, net_op_inc_v2, net_op_inc_v3, net_op_inc_v4)
+
         amort_v1, amort_v2, amort_v3, amort_v4 = get_val_by_code("4B")
         if amort_v1 == 0 and amort_v2 == 0 and amort_v3 == 0:
             amort_v1, amort_v2, amort_v3, amort_v4 = get_val_by_code("4CAB")
         amort_ttm, amort_q = calc_ttm_and_q(amort_v1, amort_v2, amort_v3, amort_v4)
         
-        favok_ttm = op_inc_ttm + amort_ttm
-        favok_q = op_inc_q + amort_q
+        favok_ttm = ebit_ttm + amort_ttm
+        favok_q = ebit_q + amort_q
         
         net_fx, _, _, _ = extract_tr_value(df, "Net Yabancı Para Pozisyonu")
         
         cf_v1, cf_v2, cf_v3, cf_v4 = extract_tr_value(df, "İşletme Faaliyetlerinden Kaynaklanan")
         cf_ttm, cf_q = calc_ttm_and_q(cf_v1, cf_v2, cf_v3, cf_v4)
         
-        ihracat_v1, ihracat_v2, ihracat_v3, ihracat_v4 = extract_tr_value(df, "Yurtdışı Satışlar")
+        ihracat_v1, ihracat_v2, ihracat_v3, ihracat_v4 = get_val_by_code("4BD")
+        if ihracat_v1 == 0 and ihracat_v2 == 0 and ihracat_v3 == 0:
+            ihracat_v1, ihracat_v2, ihracat_v3, ihracat_v4 = extract_tr_value(df, "Yurtdışı Satışlar")
         ihracat_ttm, ihracat_q = calc_ttm_and_q(ihracat_v1, ihracat_v2, ihracat_v3, ihracat_v4)
         
-        hasilat_v1, hasilat_v2, hasilat_v3, hasilat_v4 = extract_tr_value(df, "Satış Gelirleri")
+        hasilat_v1, hasilat_v2, hasilat_v3, hasilat_v4 = get_val_by_code("3C")
+        if hasilat_v1 == 0 and hasilat_v2 == 0 and hasilat_v3 == 0:
+            hasilat_v1, hasilat_v2, hasilat_v3, hasilat_v4 = extract_tr_value(df, "Satış Gelirleri")
         hasilat_ttm, hasilat_q = calc_ttm_and_q(hasilat_v1, hasilat_v2, hasilat_v3, hasilat_v4)
         
         export_ratio_ttm = (ihracat_ttm / hasilat_ttm) if hasilat_ttm != 0 else 0.0
@@ -268,8 +284,10 @@ def parse_tr_data(df, resolved_period_name, is_partial, group):
 
         return {
             "debt_equity": (borc_v1 / ozk_v1) if ozk_v1 != 0 else "N/A",
-            "op_income_ttm": op_inc_ttm, 
-            "op_income_q": op_inc_q, 
+            "ebit_ttm": ebit_ttm, 
+            "ebit_q": ebit_q, 
+            "net_op_income_ttm": net_op_inc_ttm,
+            "net_op_income_q": net_op_inc_q,
             "op_cash_flow_ttm": cf_ttm, 
             "op_cash_flow_q": cf_q, 
             "net_fx": net_fx,
@@ -343,7 +361,7 @@ def task_tr_stock(row_idx, symbol):
     df_raw, resolved_p, is_partial, group = fetch_tr_raw_data(symbol) # period_val ignored
     result = parse_tr_data(df_raw, resolved_p, is_partial, group)
     if result is None:
-        result = {k: "" for k in ['debt_equity', 'op_income_ttm', 'op_income_q', 'op_cash_flow_ttm', 'op_cash_flow_q', 'net_fx', 'export_ratio_ttm', 'export_ratio_q', 'resolved_period', 'item_2oa', 'ozk', 'net_borc', 'favok_ttm', 'favok_q']}
+        result = {k: "" for k in ['debt_equity', 'ebit_ttm', 'ebit_q', 'op_cash_flow_ttm', 'op_cash_flow_q', 'net_fx', 'export_ratio_ttm', 'export_ratio_q', 'resolved_period', 'item_2oa', 'ozk', 'net_borc', 'favok_ttm', 'favok_q', 'net_op_income_ttm', 'net_op_income_q']}
         result['is_bank'] = False
     
     try:
@@ -358,7 +376,7 @@ def task_yabanci_oran(row_idx, symbol, date_a, date_b):
     return {'row_idx': row_idx, 'symbol': symbol, 'data': fetch_yabanci_oran(symbol, date_a, date_b)}
 
 def task_historical_q(row_idx, symbol, quarter_list, live_price=None):
-    """Her çeyrek için PD/DD, FD/FAVÖK (banka hariç), Borç/Özsermaye (banka hariç); quarter_list (y,q) en güncelden eskiye.
+    """Her çeyrek için PD/DD, FD/FAVÖK (banka hariç), Borç/Özsermaye (banka hariç), İhracat Oranı; quarter_list (y,q) en güncelden eskiye.
 
     FD/FAVÖK paydası çeyreklik FAVÖK×4 iken piyasa değeri için Yabancı Oranı sayfasındaki güncel fiyat
     kullanılır (live_price); yoksa o çeyreğin tarihsel fiyatına düşülür. PD/DD tarihsel fiyatla kalır.
@@ -368,15 +386,16 @@ def task_historical_q(row_idx, symbol, quarter_list, live_price=None):
         pddd = None
         fd_favok = None
         borc_ozk = None
+        ihracat_orani = None
 
         df_hist, resolved_h, partial_h, group_h = fetch_tr_raw_data(symbol, period_val=(y, q))
         if df_hist is None:
-            cells.append((pddd, fd_favok, borc_ozk))
+            cells.append((pddd, fd_favok, borc_ozk, ihracat_orani))
             continue
 
         res = parse_tr_data(df_hist, resolved_h, partial_h, group_h)
         if not res:
-            cells.append((pddd, fd_favok, borc_ozk))
+            cells.append((pddd, fd_favok, borc_ozk, ihracat_orani))
             continue
 
         is_bank = res.get("is_bank", False)
@@ -412,7 +431,12 @@ def task_historical_q(row_idx, symbol, quarter_list, live_price=None):
             if isinstance(de, (int, float)):
                 borc_ozk = de
 
-        cells.append((pddd, fd_favok, borc_ozk))
+            if q == 12:
+                val_io = res.get("export_ratio_ttm")
+                if isinstance(val_io, (int, float)):
+                    ihracat_orani = val_io
+
+        cells.append((pddd, fd_favok, borc_ozk, ihracat_orani))
 
     return {"row_idx": row_idx, "symbol": symbol, "cells": cells}
 
@@ -463,7 +487,9 @@ def collect_snapshot_raw_rows(sym, d, yab_end, yab_change, piyasa_degeri):
         rows.append((sym, code, period_q, val, nf))
         rows.append((sym, code, period_ttm, val, nf))
 
-    snap("OP_INC", d.get("op_income_q", ""), d.get("op_income_ttm", ""), "#,##0")
+    snap("EBIT", d.get("ebit_q", ""), d.get("ebit_ttm", ""), "#,##0")
+
+    snap("NET_OP_INC", d.get("net_op_income_q", ""), d.get("net_op_income_ttm", ""), "#,##0")
 
     snap("NCF", d.get("op_cash_flow_q", ""), d.get("op_cash_flow_ttm", ""), "#,##0")
 
@@ -498,10 +524,12 @@ def collect_snapshot_raw_rows(sym, d, yab_end, yab_change, piyasa_degeri):
 def main_automation():
     file_name = "analysis.xlsx"
     sheet_yab_name = "Yabancı Oranı"
+    print("⏳ Program başlatıldı. Excel dosyası okunuyor...")
     if not os.path.exists(file_name):
         print(f"Hata: '{file_name}' dosyası bulunamadı!")
         return
     wb = load_workbook(file_name)
+    print("✅ Excel dosyası başarıyla okundu. Eski veriler temizleniyor...")
 
     excel_sheets.remove_facts_sheet_if_present(wb)
     excel_sheets.clear_managed_output_sheets_body(wb)
@@ -674,7 +702,7 @@ def main_automation():
         pack = hist_q_results_map.get(sym, {})
         cells = pack.get("cells", [])
         if len(cells) < nq:
-            cells = cells + [(None, None, None)] * (nq - len(cells))
+            cells = cells + [(None, None, None, None)] * (nq - len(cells))
         else:
             cells = cells[:nq]
         matrix_rows.append((r, sym, cells))

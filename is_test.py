@@ -6,7 +6,7 @@ def test_isyatirim_api_v2():
     
     # Sunucunun çökmemesi için tam 4 dönemi eksiksiz gönderiyoruz
     params = {
-        "companyCode": "EREGL",
+        "companyCode": "KCHOL",
         "exchange": "TRY",
         "financialGroup": "XI_29",
         "year1": "2026",
